@@ -1,0 +1,8 @@
+openai
+python-dotenv
+requests
+beautifulsoup4
+lxml
+playwright==1.62.0
+playwright-stealth==2.0.3
+tzdata

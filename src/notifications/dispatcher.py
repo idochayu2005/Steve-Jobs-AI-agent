@@ -1,0 +1,148 @@
+"""Deliver queued job alerts when Telegram connectivity is available."""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from typing import Protocol
+
+from dotenv import load_dotenv
+
+from integrations.sheets_sync import sync_sent_jobs
+from logging_config import configure_logging
+from notifications.telegram.bot import NotificationResult, TelegramNotifier
+from storage.history import JobHistoryStore
+from storage.queue import PendingAlertQueue
+
+configure_logging()
+LOGGER = logging.getLogger(__name__)
+
+
+class AlertSender(Protocol):
+    """Define the notifier behavior required by the consumer."""
+
+    def send(self, message: str) -> NotificationResult:
+        """Send one formatted alert and return its terminal result."""
+
+
+@dataclass(frozen=True)
+class DeliverySummary:
+    """Count the outcomes from one queue-processing run."""
+
+    sent: int = 0
+    failed: int = 0
+    skipped: int = 0
+
+
+class AlertConsumer:
+    """Send pending alerts and commit successful deliveries to history."""
+
+    def __init__(
+        self,
+        queue: PendingAlertQueue,
+        history: JobHistoryStore,
+        notifier: AlertSender,
+    ) -> None:
+        """Inject durable stores and a Telegram-compatible notifier."""
+
+        self.queue = queue
+        self.history = history
+        self.notifier = notifier
+        self.sent_job_ids: list[str] = []
+
+    def run(self) -> DeliverySummary:
+        """Process a queue snapshot while preserving every failed alert."""
+
+        sent = 0
+        failed = 0
+        skipped = 0
+
+        for alert in self.queue.load():
+            if self.history.contains(alert.job_id):
+                self.queue.remove(alert.job_id)
+                skipped += 1
+                LOGGER.info(
+                    "ℹ️ %s is already in history; removed from the queue.", alert.job_id
+                )
+                continue
+
+            try:
+                result = self.notifier.send(alert.llm_summary)
+            except Exception as error:
+                failed += 1
+                LOGGER.error(
+                    "❌ Sending %s failed (%s); the alert stays queued.",
+                    alert.job_id,
+                    type(error).__name__,
+                )
+                continue
+
+            if not result.success:
+                failed += 1
+                LOGGER.error(
+                    "❌ Sending %s failed (%s, %s attempts); "
+                    "the alert stays queued.",
+                    alert.job_id,
+                    result.status.value,
+                    result.attempts,
+                )
+                continue
+
+            # History is committed first. If queue removal is interrupted,
+            # the next run recognizes the delivery and removes it safely.
+            self.history.add(alert.job_id)
+            self.queue.remove(alert.job_id)
+            self.sent_job_ids.append(alert.job_id)
+            sent += 1
+            LOGGER.info(
+                "✅ Alert for %s (%s) sent and recorded in history.",
+                alert.company_name,
+                alert.job_id,
+            )
+
+        return DeliverySummary(
+            sent=sent,
+            failed=failed,
+            skipped=skipped,
+        )
+
+
+def main() -> int:
+    """Build the production consumer, process alerts, and return an exit code."""
+
+    load_dotenv()
+    try:
+        with TelegramNotifier.from_environment() as notifier:
+            consumer = AlertConsumer(
+                queue=PendingAlertQueue(),
+                history=JobHistoryStore(),
+                notifier=notifier,
+            )
+            summary = consumer.run()
+    except (OSError, ValueError) as error:
+        LOGGER.error("❌ Could not process the alert queue: %s", error)
+        return 1
+
+    # Add the jobs sent in this run to the Google Sheet (no-op if unset).
+    sync_sent_jobs(consumer.sent_job_ids)
+
+    # Read Gmail: update application statuses in the sheet and queue jobs
+    # from LinkedIn alert emails for the next cycle. Never fails the run.
+    try:
+        from integrations.gmail_sync import main as gmail_sync_main
+
+        gmail_sync_main()
+    except Exception as error:  # noqa: BLE001
+        LOGGER.error("❌ Gmail sync step failed: %s", type(error).__name__)
+
+    LOGGER.info(
+        "🏁 Queue processing finished: %s sent, %s failed, %s skipped.",
+        summary.sent,
+        summary.failed,
+        summary.skipped,
+    )
+    return 1 if summary.failed else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

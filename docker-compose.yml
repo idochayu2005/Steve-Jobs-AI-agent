@@ -1,0 +1,20 @@
+services:
+  steve_jobs_agent:
+    build:
+      context: .
+    restart: unless-stopped
+    # Run tini as PID 1. Headless Chromium leaves orphaned helper processes
+    # when a scrape ends; without an init process nothing reaps them, and
+    # they piled up as zombies (611 seen on the host after 8 days).
+    init: true
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./config:/app/config
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

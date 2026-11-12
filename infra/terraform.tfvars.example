@@ -1,0 +1,5 @@
+# Copy this file to terraform.tfvars and fill in your own values.
+subscription_id     = "00000000-0000-0000-0000-000000000000"
+resource_group_name = "rg-example"
+# Your public IPv4 (check https://api.ipify.org). Only this IP may SSH in.
+my_ip = "203.0.113.10"

@@ -1,0 +1,3993 @@
+"""Tests for bounded HTTP scraping and explicit ATS failures."""
+
+from __future__ import annotations
+
+import os
+import threading
+import unittest
+from unittest.mock import MagicMock, call, patch
+
+os.environ.setdefault("OPENAI_API_KEY", "test-openai-key")
+
+from models.results import ScrapeResult, ScrapeStatus  # noqa: E402
+from scrapers import orchestrator as scraper  # noqa: E402
+from scrapers.api import client as api_client  # noqa: E402
+from scrapers.browser import custom_adapters  # noqa: E402
+
+
+class FetchAtsJobsTests(unittest.TestCase):
+    """Verify the mapping-driven JSON ATS interface directly."""
+
+    def test_lever_mapping_normalizes_array_payload(self) -> None:
+        """Normalize Lever's raw posting array without an envelope."""
+
+        response = MagicMock()
+        response.json.return_value = [
+            {
+                "id": "lever-123",
+                "text": "Graduate Software Dev Engineer",
+                "categories": {"location": "Jerusalem, Israel"},
+                "hostedUrl": (
+                    "https://jobs.eu.lever.co/mobileye/lever-123"
+                ),
+                "descriptionPlain": "Build autonomous-driving software.",
+                "additionalPlain": "Work with perception teams.",
+                "lists": [
+                    {
+                        "text": "Requirements",
+                        "content": "B.Sc. in Computer Science.",
+                    }
+                ],
+            }
+        ]
+        company = {
+            "company_id": "mobileye",
+            "company_name": "Mobileye",
+            "ats_type": "lever",
+            "api_url": (
+                "https://api.eu.lever.co/v0/postings/"
+                "mobileye?mode=json"
+            ),
+        }
+
+        with patch(
+            "scrapers.api.client.requests.get",
+            return_value=response,
+        ) as get:
+            result = scraper.fetch_ats_jobs(
+                company,
+                scraper.ATS_FIELD_MAP["lever"],
+            )
+
+        self.assertIsNone(scraper.ATS_FIELD_MAP["lever"].envelope_key)
+        self.assertEqual(result.status, ScrapeStatus.SUCCESS)
+        self.assertEqual(
+            result.jobs,
+            [
+                {
+                    "id": "mobileye_lever-123",
+                    "title": "Graduate Software Dev Engineer",
+                    "location": "Jerusalem, Israel",
+                    "url": (
+                        "https://jobs.eu.lever.co/mobileye/lever-123"
+                    ),
+                    "content": (
+                        "Build autonomous-driving software.\n"
+                        "Work with perception teams.\n"
+                        "Requirements\n"
+                        "B.Sc. in Computer Science."
+                    ),
+                }
+            ],
+        )
+        get.assert_called_once_with(
+            company["api_url"],
+            headers=api_client.DEFAULT_REQUEST_HEADERS,
+            timeout=15,
+        )
+
+    def test_get_mappings_normalize_jobs(self) -> None:
+        """Normalize every GET-based ATS through one fetching interface."""
+
+        cases = (
+            (
+                "greenhouse",
+                {
+                    "jobs": [
+                        {
+                            "id": 101,
+                            "title": "Student Developer",
+                            "location": {"name": "Tel Aviv, Israel"},
+                            "absolute_url": "https://jobs.test/101",
+                            "content": "<p>Build APIs.</p>",
+                            "description": "Support production.",
+                        }
+                    ]
+                },
+                {
+                    "id": "example_101",
+                    "title": "Student Developer",
+                    "location": "Tel Aviv, Israel",
+                    "url": "https://jobs.test/101",
+                    "content": "Build APIs.\nSupport production.",
+                },
+            ),
+            (
+                "amazon_jobs",
+                {
+                    "jobs": [
+                        {
+                            "id_ic": "A-102",
+                            "title": "Software Engineer Intern",
+                            "city": "Haifa",
+                            "job_path": "/en/jobs/A-102",
+                            "description": "Build services.",
+                            "basic_qualifications": "Study CS.",
+                            "preferred_qualifications": "Know Python.",
+                        }
+                    ]
+                },
+                {
+                    "id": "example_A-102",
+                    "title": "Software Engineer Intern",
+                    "location": "Haifa",
+                    "url": "https://www.amazon.jobs/en/jobs/A-102",
+                    "content": (
+                        "Build services.\nStudy CS.\nKnow Python."
+                    ),
+                },
+            ),
+            (
+                "smartrecruiters",
+                {
+                    "content": [
+                        {
+                            "id": "SR-103",
+                            "name": "Junior Data Analyst",
+                            "location": {"city": "Jerusalem"},
+                            "ref": "https://jobs.test/SR-103",
+                            "jobAd": "Analyze data.",
+                            "description": "Create reports.",
+                        }
+                    ]
+                },
+                {
+                    "id": "example_SR-103",
+                    "title": "Junior Data Analyst",
+                    "location": "Jerusalem",
+                    "url": "https://jobs.test/SR-103",
+                    "content": "Analyze data.\nCreate reports.",
+                },
+            ),
+            (
+                "ashby",
+                {
+                    "jobs": [
+                        {
+                            "id": "ASH-104",
+                            "title": "Student Backend Engineer",
+                            "location": "Ramat Gan",
+                            "jobUrl": "https://jobs.test/ASH-104",
+                            "descriptionPlain": "Build backends.",
+                            "descriptionHtml": "<p>Work in Python.</p>",
+                            "description": "Learn quickly.",
+                        }
+                    ]
+                },
+                {
+                    "id": "example_ASH-104",
+                    "title": "Student Backend Engineer",
+                    "location": "Ramat Gan",
+                    "url": "https://jobs.test/ASH-104",
+                    "content": (
+                        "Build backends.\nWork in Python.\nLearn quickly."
+                    ),
+                },
+            ),
+        )
+
+        for ats_type, payload, expected_job in cases:
+            with self.subTest(ats_type=ats_type):
+                response = MagicMock()
+                response.json.return_value = payload
+                company = self._company(ats_type)
+                with patch(
+                    "scrapers.api.client.requests.get",
+                    return_value=response,
+                ) as get:
+                    result = scraper.fetch_ats_jobs(
+                        company,
+                        scraper.ATS_FIELD_MAP[ats_type],
+                    )
+
+                self.assertEqual(result.status, ScrapeStatus.SUCCESS)
+                self.assertEqual(result.jobs, [expected_job])
+                expected_kwargs = {
+                    "headers": api_client.DEFAULT_REQUEST_HEADERS,
+                    "timeout": 15,
+                }
+                pagination = scraper.ATS_FIELD_MAP[ats_type].pagination
+                if pagination is not None:
+                    expected_kwargs["params"] = {
+                        pagination.offset_key: 0,
+                        pagination.limit_key: pagination.page_size,
+                    }
+                get.assert_called_once_with(
+                    "https://example.test/api",
+                    **expected_kwargs,
+                )
+                response.raise_for_status.assert_called_once_with()
+
+    def test_paginated_get_mappings_fetch_every_offset(self) -> None:
+        """Follow public GET pagination until every advertised job is read."""
+
+        cases = (
+            ("smartrecruiters", "content", "totalFound", "limit"),
+            ("amazon_jobs", "jobs", "hits", "result_limit"),
+        )
+        for ats_type, envelope_key, total_key, limit_key in cases:
+            with self.subTest(ats_type=ats_type):
+                if ats_type == "smartrecruiters":
+                    first_jobs = [
+                        {
+                            "id": f"SR-{index}",
+                            "name": f"Role {index}",
+                            "location": {"city": "City"},
+                            "ref": f"https://jobs.test/SR-{index}",
+                        }
+                        for index in range(100)
+                    ]
+                    last_job = {
+                        "id": "SR-100",
+                        "name": "Role 100",
+                        "location": {"city": "City"},
+                        "ref": "https://jobs.test/SR-100",
+                    }
+                else:
+                    first_jobs = [
+                        {
+                            "id_ic": f"A-{index}",
+                            "title": f"Role {index}",
+                            "city": "City",
+                            "job_path": f"/en/jobs/A-{index}",
+                        }
+                        for index in range(100)
+                    ]
+                    last_job = {
+                        "id_ic": "A-100",
+                        "title": "Role 100",
+                        "city": "City",
+                        "job_path": "/en/jobs/A-100",
+                    }
+
+                first_response = MagicMock()
+                first_response.json.return_value = {
+                    envelope_key: first_jobs,
+                    total_key: 101,
+                }
+                second_response = MagicMock()
+                second_response.json.return_value = {
+                    envelope_key: [last_job],
+                    total_key: 101,
+                }
+                with patch(
+                    "scrapers.api.client.requests.get",
+                    side_effect=[first_response, second_response],
+                ) as get:
+                    result = scraper.fetch_ats_jobs(
+                        self._company(ats_type),
+                        scraper.ATS_FIELD_MAP[ats_type],
+                    )
+
+                self.assertEqual(result.status, ScrapeStatus.SUCCESS)
+                self.assertEqual(len(result.jobs), 101)
+                self.assertEqual(get.call_count, 2)
+                self.assertEqual(
+                    [
+                        call.kwargs["params"]["offset"]
+                        for call in get.call_args_list
+                    ],
+                    [0, 100],
+                )
+                self.assertTrue(
+                    all(
+                        call.kwargs["params"][limit_key] == 100
+                        for call in get.call_args_list
+                    )
+                )
+
+    def test_workday_mapping_posts_payload_and_builds_job_url(self) -> None:
+        """Use Workday's POST configuration and derived career base URL."""
+
+        response = MagicMock()
+        response.json.return_value = {
+            "total": 1,
+            "jobPostings": [
+                {
+                    "bulletinId": "WD-105",
+                    "title": "Student Software Engineer",
+                    "locationsText": "Israel",
+                    "externalPath": "/job/WD-105",
+                    "jobDescription": "Build software.",
+                    "description": "Join the platform team.",
+                }
+            ]
+        }
+        company = {
+            **self._company("workday"),
+            "api_url": (
+                "https://example.test/wday/cxs/example/jobs"
+            ),
+        }
+
+        with (
+            patch(
+                "scrapers.api.client.requests.post",
+                return_value=response,
+            ) as post,
+            patch("builtins.print"),
+        ):
+            result = scraper.fetch_ats_jobs(
+                company,
+                scraper.ATS_FIELD_MAP["workday"],
+            )
+
+        self.assertEqual(result.status, ScrapeStatus.SUCCESS)
+        self.assertEqual(
+            result.jobs,
+            [
+                {
+                    "id": "example_WD-105",
+                    "title": "Student Software Engineer",
+                    "location": "Israel",
+                    "url": "https://example.test/job/WD-105",
+                    "content": (
+                        "Build software.\nJoin the platform team."
+                    ),
+                }
+            ],
+        )
+        self.assertEqual(post.call_count, 2)
+        self.assertEqual(
+            post.call_args_list[0].kwargs["json"],
+            {
+                "limit": 1,
+                "offset": 0,
+                "appliedFacets": {},
+                "searchText": "",
+            },
+        )
+        actual_call = post.call_args_list[1]
+        self.assertEqual(
+            actual_call.args,
+            ("https://example.test/wday/cxs/example/jobs",),
+        )
+        self.assertEqual(
+            actual_call.kwargs,
+            {
+                "json": {
+                    "limit": 20,
+                    "offset": 0,
+                    "appliedFacets": {},
+                    "searchText": "",
+                },
+                "headers": {
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/152.0.0.0 Safari/537.36"
+                    ),
+                },
+                "timeout": 15,
+            },
+        )
+
+    def test_workday_mapping_fetches_every_unscoped_page(self) -> None:
+        """Request every Workday page when no Israel facet is available."""
+
+        first_page_jobs = [
+            {
+                "bulletinId": f"WD-{index}",
+                "title": f"Israel Software Role {index}",
+                "locationsText": "Israel",
+                "externalPath": f"/job/WD-{index}",
+            }
+            for index in range(20)
+        ]
+        last_job = {
+            "bulletinId": "WD-20",
+            "title": "Israel Software Role 20",
+            "locationsText": "Israel",
+            "externalPath": "/job/WD-20",
+        }
+        first_response = MagicMock()
+        first_response.json.return_value = {
+            "total": 21,
+            "jobPostings": first_page_jobs,
+        }
+        second_response = MagicMock()
+        second_response.json.return_value = {
+            "total": 21,
+            "jobPostings": [last_job],
+        }
+        discovery_response = MagicMock()
+        discovery_response.json.return_value = {
+            "total": 2000,
+            "jobPostings": [],
+            "facets": [],
+        }
+        company = {
+            **self._company("workday"),
+            "api_url": "https://example.test/wday/cxs/example/jobs",
+        }
+
+        with (
+            patch(
+                "scrapers.api.client.requests.post",
+                side_effect=[
+                    discovery_response,
+                    first_response,
+                    second_response,
+                ],
+            ) as post,
+            patch("builtins.print"),
+        ):
+            result = scraper.fetch_ats_jobs(
+                company,
+                scraper.ATS_FIELD_MAP["workday"],
+            )
+
+        self.assertEqual(result.status, ScrapeStatus.SUCCESS)
+        self.assertEqual(len(result.jobs), 21)
+        self.assertEqual(result.jobs[-1]["id"], "example_WD-20")
+        self.assertEqual(post.call_count, 3)
+        self.assertEqual(
+            post.call_args_list[0].kwargs["json"]["searchText"],
+            "",
+        )
+        self.assertEqual(
+            [
+                call.kwargs["json"]["offset"]
+                for call in post.call_args_list[1:]
+            ],
+            [0, 20],
+        )
+        self.assertTrue(
+            all(
+                call.kwargs["json"]["searchText"] == ""
+                for call in post.call_args_list[1:]
+            )
+        )
+
+    def test_workday_without_israel_facet_uses_unfiltered_search(self) -> None:
+        """Keep city-only Israeli postings visible to downstream filtering."""
+
+        discovery_response = MagicMock()
+        discovery_response.json.return_value = {
+            "total": 1,
+            "jobPostings": [],
+            "facets": [],
+        }
+        jobs_response = MagicMock()
+        jobs_response.json.return_value = {
+            "total": 1,
+            "jobPostings": [
+                {
+                    "bulletinId": "IL-CITY-1",
+                    "title": "Software Engineer",
+                    "locationsText": "Hod Hasharon",
+                    "externalPath": "/job/IL-CITY-1",
+                },
+            ],
+        }
+        with patch(
+            "scrapers.api.client.requests.post",
+            side_effect=[discovery_response, jobs_response],
+        ) as post:
+            result = scraper.fetch_ats_jobs(
+                self._company("workday"),
+                scraper.ATS_FIELD_MAP["workday"],
+            )
+
+        self.assertEqual(result.status, ScrapeStatus.SUCCESS)
+        self.assertEqual(result.jobs[0]["location"], "Hod Hasharon")
+        self.assertEqual(
+            post.call_args_list[1].kwargs["json"]["searchText"],
+            "",
+        )
+
+    def test_pagination_keeps_prior_total_when_later_pages_report_zero(
+        self,
+    ) -> None:
+        """Do not truncate Workday tenants that omit totals after page one."""
+
+        pages = []
+        page_specs = ((0, 20, 41), (20, 20, 0), (40, 1, 0))
+        for start, size, total in page_specs:
+            response = MagicMock()
+            response.json.return_value = {
+                "total": total,
+                "jobPostings": [
+                    {
+                        "bulletinId": f"WD-{index}",
+                        "title": f"Role {index}",
+                        "locationsText": "City",
+                        "externalPath": f"/job/WD-{index}",
+                    }
+                    for index in range(start, start + size)
+                ],
+            }
+            pages.append(response)
+        discovery = MagicMock()
+        discovery.json.return_value = {
+            "total": 41,
+            "jobPostings": [],
+            "facets": [],
+        }
+        with patch(
+            "scrapers.api.client.requests.post",
+            side_effect=[discovery, *pages],
+        ) as post:
+            result = scraper.fetch_ats_jobs(
+                self._company("workday"),
+                scraper.ATS_FIELD_MAP["workday"],
+            )
+
+        self.assertEqual(result.status, ScrapeStatus.SUCCESS)
+        self.assertEqual(len(result.jobs), 41)
+        self.assertEqual(
+            [
+                call.kwargs["json"]["offset"]
+                for call in post.call_args_list[1:]
+            ],
+            [0, 20, 40],
+        )
+
+    def test_workday_discovers_and_applies_israel_location_facet(self) -> None:
+        """Prefer a real Workday location facet over full-text matching."""
+
+        discovery_response = MagicMock()
+        discovery_response.json.return_value = {
+            "total": 2000,
+            "jobPostings": [
+                {
+                    "bulletinId": "GLOBAL-1",
+                    "title": "Global Role",
+                    "locationsText": "Bangalore, India",
+                    "externalPath": "/job/GLOBAL-1",
+                }
+            ],
+            "facets": [
+                {
+                    "facetParameter": "locationMainGroup",
+                    "values": [
+                        {
+                            "facetParameter": "locationHierarchy1",
+                            "descriptor": "Locations",
+                            "values": [
+                                {
+                                    "descriptor": "Israel",
+                                    "id": "israel-facet-id",
+                                    "count": 21,
+                                },
+                                {
+                                    "descriptor": "India",
+                                    "id": "india-facet-id",
+                                    "count": 500,
+                                },
+                            ],
+                        }
+                    ],
+                }
+            ],
+        }
+        scoped_response = MagicMock()
+        scoped_response.json.return_value = {
+            "total": 1,
+            "jobPostings": [
+                {
+                    "bulletinId": "IL-1",
+                    "title": "Student Software Engineer",
+                    "locationsText": "2 Locations",
+                    "externalPath": "/job/IL-1",
+                }
+            ],
+        }
+        company = {
+            **self._company("workday"),
+            "api_url": "https://example.test/wday/cxs/example/jobs",
+        }
+
+        with patch(
+            "scrapers.api.client.requests.post",
+            side_effect=[discovery_response, scoped_response],
+        ) as post:
+            result = scraper.fetch_ats_jobs(
+                company,
+                scraper.ATS_FIELD_MAP["workday"],
+            )
+
+        self.assertEqual(result.status, ScrapeStatus.SUCCESS)
+        self.assertEqual(
+            [job["id"] for job in result.jobs],
+            ["example_IL-1"],
+        )
+        self.assertEqual(result.jobs[0]["location"], "Israel\n2 Locations")
+        self.assertEqual(post.call_count, 2)
+        discovery_payload = post.call_args_list[0].kwargs["json"]
+        self.assertEqual(discovery_payload["searchText"], "")
+        self.assertEqual(discovery_payload["limit"], 1)
+        scoped_payload = post.call_args_list[1].kwargs["json"]
+        self.assertEqual(scoped_payload["searchText"], "")
+        self.assertEqual(
+            scoped_payload["appliedFacets"],
+            {"locationHierarchy1": ["israel-facet-id"]},
+        )
+
+    def test_workday_scope_supports_country_and_city_facet_names(self) -> None:
+        """Handle Workday tenant-specific location parameter conventions."""
+
+        scope_fn = scraper.ATS_FIELD_MAP["workday"].scope_payload_fn
+        self.assertIsNotNone(scope_fn)
+        cases = [
+            (
+                {
+                    "facets": [
+                        {
+                            "facetParameter": "Country",
+                            "values": [
+                                {
+                                    "descriptor": "Israel",
+                                    "id": "country-israel-id",
+                                }
+                            ],
+                        }
+                    ]
+                },
+                ["Israel", "Migdal HaEmek"],
+                {"Country": ["country-israel-id"]},
+            ),
+            (
+                {
+                    "facets": [
+                        {
+                            "facetParameter": "locations",
+                            "values": [
+                                {
+                                    "descriptor": "Rehovot,ISR",
+                                    "id": "rehovot-id",
+                                },
+                                {
+                                    "descriptor": "Bangalore,IND",
+                                    "id": "bangalore-id",
+                                },
+                            ],
+                        }
+                    ]
+                },
+                ["Israel", "Rehovot"],
+                {"locations": ["rehovot-id"]},
+            ),
+            (
+                {
+                    "facets": [
+                        {
+                            "facetParameter": "Location",
+                            "values": [
+                                {
+                                    "descriptor": "Yokneam",
+                                    "id": "yokneam-id",
+                                },
+                                {
+                                    "descriptor": "IL - Petah Tikva",
+                                    "id": "petah-tikva-id",
+                                },
+                            ],
+                        }
+                    ]
+                },
+                ["Israel", "Petah Tikva", "Yokneam"],
+                {"Location": ["yokneam-id", "petah-tikva-id"]},
+            ),
+        ]
+
+        for payload, location_filters, expected_facets in cases:
+            with self.subTest(expected_facets=expected_facets):
+                scope = scope_fn(
+                    payload,
+                    {"location_filters": location_filters},
+                )
+                self.assertIsNotNone(scope)
+                self.assertEqual(scope["appliedFacets"], expected_facets)
+                self.assertEqual(scope["searchText"], "")
+
+    def test_retries_cloudflare_status_once(self) -> None:
+        """Retry one time for throttling and Cloudflare edge failures."""
+
+        for status_code in (429, 520, 521, 522, 523, 524):
+            with self.subTest(status_code=status_code):
+                failed_response = MagicMock()
+                failed_response.status_code = status_code
+                failed_response.headers = {}
+                failed_response.raise_for_status.side_effect = (
+                    api_client.requests.exceptions.HTTPError(
+                        response=failed_response,
+                    )
+                )
+                successful_response = MagicMock()
+                successful_response.status_code = 200
+                successful_response.json.return_value = {"jobs": []}
+
+                with (
+                    patch(
+                        "scrapers.api.client.requests.get",
+                        side_effect=[
+                            failed_response,
+                            successful_response,
+                        ],
+                    ) as get,
+                    patch("scrapers.api.client.time.sleep") as sleep,
+                    patch("builtins.print"),
+                ):
+                    result = scraper.fetch_ats_jobs(
+                        self._company("greenhouse"),
+                        scraper.ATS_FIELD_MAP["greenhouse"],
+                    )
+
+                self.assertEqual(result.status, ScrapeStatus.NO_JOBS)
+                self.assertEqual(result.jobs, [])
+                self.assertEqual(get.call_count, 2)
+                sleep.assert_called_once_with(
+                    api_client.RETRY_DELAY_SECONDS
+                )
+
+    def test_retries_connection_and_timeout_errors_once(self) -> None:
+        """Retry common transient transport failures one time."""
+
+        errors = (
+            api_client.requests.exceptions.ConnectionError(
+                "connection reset"
+            ),
+            api_client.requests.exceptions.Timeout("request timed out"),
+        )
+        for error in errors:
+            with self.subTest(error_type=type(error).__name__):
+                response = MagicMock()
+                response.json.return_value = {"jobs": []}
+                with (
+                    patch(
+                        "scrapers.api.client.requests.get",
+                        side_effect=[error, response],
+                    ) as get,
+                    patch("scrapers.api.client.time.sleep") as sleep,
+                    patch("builtins.print"),
+                ):
+                    result = scraper.fetch_ats_jobs(
+                        self._company("greenhouse"),
+                        scraper.ATS_FIELD_MAP["greenhouse"],
+                    )
+
+                self.assertEqual(result.status, ScrapeStatus.NO_JOBS)
+                self.assertEqual(result.jobs, [])
+                self.assertEqual(get.call_count, 2)
+                sleep.assert_called_once_with(
+                    api_client.RETRY_DELAY_SECONDS
+                )
+
+    def test_retry_respects_retry_after_header(self) -> None:
+        """Use the server-provided retry delay when it is numeric."""
+
+        failed_response = MagicMock()
+        failed_response.status_code = 429
+        failed_response.headers = {"Retry-After": "2"}
+        failed_response.raise_for_status.side_effect = (
+            api_client.requests.exceptions.HTTPError(
+                response=failed_response,
+            )
+        )
+        successful_response = MagicMock()
+        successful_response.json.return_value = {"jobs": []}
+
+        with (
+            patch(
+                "scrapers.api.client.requests.get",
+                side_effect=[failed_response, successful_response],
+            ),
+            patch("scrapers.api.client.time.sleep") as sleep,
+            patch("builtins.print"),
+        ):
+            result = scraper.fetch_ats_jobs(
+                self._company("greenhouse"),
+                scraper.ATS_FIELD_MAP["greenhouse"],
+            )
+
+        self.assertEqual(result.status, ScrapeStatus.NO_JOBS)
+        self.assertEqual(result.jobs, [])
+        sleep.assert_called_once_with(2.0)
+
+    def test_retry_after_header_is_capped(self) -> None:
+        """Prevent excessive server retry delays from blocking the producer."""
+
+        failed_response = MagicMock()
+        failed_response.status_code = 429
+        failed_response.headers = {"Retry-After": "3600"}
+        failed_response.raise_for_status.side_effect = (
+            api_client.requests.exceptions.HTTPError(
+                response=failed_response,
+            )
+        )
+        successful_response = MagicMock()
+        successful_response.json.return_value = {"jobs": []}
+
+        with (
+            patch(
+                "scrapers.api.client.requests.get",
+                side_effect=[failed_response, successful_response],
+            ),
+            patch("scrapers.api.client.time.sleep") as sleep,
+            patch("builtins.print"),
+        ):
+            result = scraper.fetch_ats_jobs(
+                self._company("greenhouse"),
+                scraper.ATS_FIELD_MAP["greenhouse"],
+            )
+
+        self.assertEqual(result.status, ScrapeStatus.NO_JOBS)
+        self.assertEqual(result.jobs, [])
+        sleep.assert_called_once_with(5.0)
+
+    def test_workday_mapping_handles_configured_http_status(self) -> None:
+        """Classify Workday's configured auth error as an HTTP block."""
+
+        response = MagicMock()
+        response.status_code = 403
+        error = api_client.requests.exceptions.HTTPError(response=response)
+        response.raise_for_status.side_effect = error
+
+        with (
+            patch(
+                "scrapers.api.client.requests.post",
+                return_value=response,
+            ),
+            patch("scrapers.api.client.LOGGER.warning") as warning,
+        ):
+            result = scraper.fetch_ats_jobs(
+                self._company("workday"),
+                scraper.ATS_FIELD_MAP["workday"],
+            )
+
+        self.assertEqual(result.status, ScrapeStatus.WAF_BLOCKED)
+        self.assertEqual(result.jobs, [])
+        self.assertIn("403", str(warning.call_args))
+
+    def test_all_blocking_http_statuses_are_waf_blocked(self) -> None:
+        """Classify 401, 403, and 429 independently of mapping metadata."""
+
+        for status_code in (401, 403, 429):
+            with self.subTest(status_code=status_code):
+                response = MagicMock()
+                response.status_code = status_code
+                response.headers = {}
+                response.raise_for_status.side_effect = (
+                    api_client.requests.exceptions.HTTPError(
+                        response=response,
+                    )
+                )
+                with (
+                    patch(
+                        "scrapers.api.client.requests.get",
+                        return_value=response,
+                    ),
+                    patch("scrapers.api.client.time.sleep"),
+                ):
+                    result = scraper.fetch_ats_jobs(
+                        self._company("greenhouse"),
+                        scraper.ATS_FIELD_MAP["greenhouse"],
+                    )
+
+                self.assertEqual(result.status, ScrapeStatus.WAF_BLOCKED)
+                self.assertEqual(result.jobs, [])
+                self.assertIn(str(status_code), result.message)
+
+    def test_other_http_and_parsing_errors_are_failed(self) -> None:
+        """Keep non-blocking HTTP and response parsing failures explicit."""
+
+        http_response = MagicMock()
+        http_response.status_code = 500
+        http_response.raise_for_status.side_effect = (
+            api_client.requests.exceptions.HTTPError(
+                response=http_response,
+            )
+        )
+        with patch(
+            "scrapers.api.client.requests.get",
+            return_value=http_response,
+        ):
+            http_result = scraper.fetch_ats_jobs(
+                self._company("greenhouse"),
+                scraper.ATS_FIELD_MAP["greenhouse"],
+            )
+
+        parsing_response = MagicMock()
+        parsing_response.json.side_effect = ValueError("invalid JSON")
+        with patch(
+            "scrapers.api.client.requests.get",
+            return_value=parsing_response,
+        ):
+            parsing_result = scraper.fetch_ats_jobs(
+                self._company("greenhouse"),
+                scraper.ATS_FIELD_MAP["greenhouse"],
+            )
+
+        self.assertEqual(http_result.status, ScrapeStatus.FAILED)
+        self.assertEqual(http_result.jobs, [])
+        self.assertEqual(parsing_result.status, ScrapeStatus.FAILED)
+        self.assertEqual(parsing_result.jobs, [])
+
+    def test_empty_or_malformed_envelope_is_no_jobs(self) -> None:
+        """Distinguish a readable empty envelope from a request failure."""
+
+        for payload in ({"jobs": []}, {"jobs": {}}, []):
+            with self.subTest(payload=payload):
+                response = MagicMock()
+                response.json.return_value = payload
+                with patch(
+                    "scrapers.api.client.requests.get",
+                    return_value=response,
+                ):
+                    result = scraper.fetch_ats_jobs(
+                        self._company("greenhouse"),
+                        scraper.ATS_FIELD_MAP["greenhouse"],
+                    )
+
+                self.assertEqual(result.status, ScrapeStatus.NO_JOBS)
+                self.assertEqual(result.jobs, [])
+
+    def test_greenhouse_eu_reuses_greenhouse_mapping(self) -> None:
+        """Keep the EU ATS name as a true alias of Greenhouse rules."""
+
+        self.assertIs(
+            scraper.ATS_FIELD_MAP["greenhouse_eu"],
+            scraper.ATS_FIELD_MAP["greenhouse"],
+        )
+
+    @staticmethod
+    def _company(ats_type: str) -> dict[str, object]:
+        """Return minimal company configuration for direct ATS fetching."""
+
+        return {
+            "company_id": "example",
+            "company_name": "Example",
+            "ats_type": ats_type,
+            "api_url": "https://example.test/api",
+        }
+
+
+class CompanyRoutingValidationTests(unittest.TestCase):
+    """Verify startup validation identifies active unroutable configs."""
+
+    def test_valid_active_companies_have_no_routing_errors(self) -> None:
+        """Accept JSON, direct, and browser-backed routing strategies."""
+
+        companies = [
+            {
+                "company_id": "greenhouse-company",
+                "ats_type": "greenhouse",
+                "is_active": True,
+            },
+            {
+                "company_id": "successfactors-company",
+                "ats_type": "successfactors",
+                "is_active": True,
+            },
+            {
+                "company_id": "eightfold-company",
+                "ats_type": "eightfold",
+                "is_active": True,
+            },
+            {
+                "company_id": "browser-company",
+                "ats_type": "custom",
+                "fetch_strategy": "browser",
+                "is_active": True,
+            },
+            {
+                "company_id": "iai",
+                "ats_type": "custom",
+                "fetch_strategy": "api",
+                "is_active": True,
+            },
+        ]
+
+        self.assertEqual(scraper.validate_company_routing(companies), [])
+
+    def test_shared_custom_api_adapter_by_ats_type_is_routable(self) -> None:
+        """Recognize ATS types served by one shared custom API adapter.
+
+        ``fetch_jobs_from_company`` routes these through
+        ``CUSTOM_API_ADAPTERS_BY_ATS_TYPE``; validation that does not know
+        that registry reports healthy companies as unroutable every run.
+        """
+
+        companies = [
+            {
+                "company_id": "oracle",
+                "ats_type": "oracle_recruiting_cloud",
+                "fetch_strategy": "api",
+                "is_active": True,
+            },
+            {
+                "company_id": "akamai",
+                "ats_type": "oracle_recruiting_cloud",
+                "fetch_strategy": "api",
+                "is_active": True,
+            },
+        ]
+
+        self.assertEqual(scraper.validate_company_routing(companies), [])
+
+    def test_bad_active_config_returns_company_id(self) -> None:
+        """Report active configs that have no available fetch route."""
+
+        companies = [
+            {
+                "company_id": "unroutable-company",
+                "ats_type": "unsupported",
+                "is_active": True,
+            }
+        ]
+
+        self.assertEqual(
+            scraper.validate_company_routing(companies),
+            ["unroutable-company"],
+        )
+
+
+class CompanyConfigurationTests(unittest.TestCase):
+    """Pin the production routes for previously silent zero-job sources."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        """Load production company configuration once for contract checks."""
+
+        companies = scraper.load_json(
+            scraper.CONFIG_DIR / "companies.json"
+        )
+        cls.companies = {
+            company["company_id"]: company for company in companies
+        }
+
+    def _assert_step8_routes(
+        self,
+        ats_type: str,
+        expected_routes: dict[str, str],
+    ) -> None:
+        """Assert exact routing fields for one small step-8 company group."""
+
+        for company_id, api_url in expected_routes.items():
+            with self.subTest(company_id=company_id):
+                company = self.companies[company_id]
+                self.assertTrue(company["is_active"])
+                self.assertEqual(company["ats_type"], ats_type)
+                self.assertEqual(company["fetch_strategy"], "api")
+                self.assertEqual(company["api_url"], api_url)
+                self.assertIn("Israel", company["location_filters"])
+
+    def test_step8_batch1_comeet_routes_group_one(self) -> None:
+        """Pin the first ten independently verified Comeet routes."""
+
+        self._assert_step8_routes("comeet", {
+            "port": "https://www.comeet.com/jobs/port/59.004",
+            "drivenets": "https://www.comeet.com/jobs/drivenets/72.006",
+            "rounds": "https://www.comeet.com/jobs/rounds/59.005",
+            "elsight": "https://www.comeet.com/jobs/elsight/B9.006",
+            "commit": "https://www.comeet.com/jobs/comm-it/76.008",
+            "gett": "https://www.comeet.com/jobs/gett/A0.002",
+            "aitech": "https://www.comeet.com/jobs/aitechsystems/88.004",
+            "airobotics": "https://www.comeet.com/jobs/airobotics/AA.005",
+            "newphotonics": "https://www.comeet.com/jobs/newphotonics/89.000",
+            "pango": "https://www.comeet.com/jobs/pango/59.002",
+        })
+
+    def test_step8_batch1_comeet_routes_group_two(self) -> None:
+        """Pin the second ten independently verified Comeet routes."""
+
+        self._assert_step8_routes("comeet", {
+            "abra_rnd": "https://www.comeet.com/jobs/abra_rnd/15.007",
+            "biocatch": "https://www.comeet.com/jobs/biocatch/03.00E",
+            "classiq": "https://www.comeet.com/jobs/classiq/F7.008",
+            "aqua_security": "https://www.comeet.com/jobs/aquasec/91.001",
+            "atera": "https://www.comeet.com/jobs/atera/63.00B",
+            "akeyless": "https://www.comeet.com/jobs/akeyless/27.006",
+            "cross_river": "https://www.comeet.com/jobs/crossriver/C7.00F",
+            "remedio": "https://www.comeet.com/jobs/remedio/CA.000",
+            "kayhut": "https://www.comeet.com/jobs/Kayhut/F0.00B",
+            "backslash_security": (
+                "https://www.comeet.com/jobs/backslash/98.004"
+            ),
+        })
+
+    def test_step8_batch1_comeet_routes_group_three(self) -> None:
+        """Pin the remaining verified Comeet board and embed routes."""
+
+        self._assert_step8_routes("comeet", {
+            "oligo_security": (
+                "https://www.comeet.com/jobs/oligosecurity/5A.00B"
+            ),
+            "pentera": "https://www.comeet.com/jobs/pentera/C5.00D",
+            "zero_networks": (
+                "https://www.comeet.com/jobs/zeronetworks/39.00F"
+            ),
+            "superplay": "https://www.comeet.com/jobs/superplay/28.003",
+            "fetcherr": "https://www.fetcherr.io/careers",
+            "navina": "https://www.navina.ai/careers",
+            "nym_health": "https://nym.health/careers/",
+            "windward": "https://windward.ai/careers/",
+            "clover_security": (
+                "https://www.comeet.com/jobs/clover_security/7A.00A"
+            ),
+        })
+
+    def test_step8_batch1_greenhouse_routes_group_one(self) -> None:
+        """Pin six verified Greenhouse board tokens."""
+
+        self._assert_step8_routes("greenhouse", {
+            "apiiro": (
+                "https://boards-api.greenhouse.io/v1/boards/apiiro/"
+                "jobs?content=true"
+            ),
+            "axonius": (
+                "https://boards-api.greenhouse.io/v1/boards/axonius/"
+                "jobs?content=true"
+            ),
+            "eleos_health": (
+                "https://boards-api.greenhouse.io/v1/boards/eleoshealth/"
+                "jobs?content=true"
+            ),
+            "hello_heart": (
+                "https://boards-api.greenhouse.io/v1/boards/helloheart/"
+                "jobs?content=true"
+            ),
+            "mongodb": (
+                "https://boards-api.greenhouse.io/v1/boards/mongodb/"
+                "jobs?content=true"
+            ),
+            "nanit": (
+                "https://boards-api.greenhouse.io/v1/boards/nanit/"
+                "jobs?content=true"
+            ),
+        })
+
+    def test_step8_batch1_greenhouse_routes_group_two(self) -> None:
+        """Pin the other five verified Greenhouse board tokens."""
+
+        self._assert_step8_routes("greenhouse", {
+            "pendo": (
+                "https://boards-api.greenhouse.io/v1/boards/pendo/"
+                "jobs?content=true"
+            ),
+            "token_security": (
+                "https://boards-api.greenhouse.io/v1/boards/tokensecurity/"
+                "jobs?content=true"
+            ),
+            "torii": (
+                "https://boards-api.greenhouse.io/v1/boards/toriihq/"
+                "jobs?content=true"
+            ),
+            "wedev": (
+                "https://boards-api.greenhouse.io/v1/boards/wedev/"
+                "jobs?content=true"
+            ),
+            "wolt_israel": (
+                "https://boards-api.greenhouse.io/v1/boards/wolt/"
+                "jobs?content=true"
+            ),
+        })
+
+    def test_step8_batch1_ashby_routes(self) -> None:
+        """Pin the two verified Ashby board tokens."""
+
+        self._assert_step8_routes("ashby", {
+            "moon_active": (
+                "https://api.ashbyhq.com/posting-api/job-board/moonactive"
+            ),
+            "finout": "https://api.ashbyhq.com/posting-api/job-board/finout",
+        })
+
+    def test_step8_batch1_workday_routes(self) -> None:
+        """Pin the two verified Workday tenants and sites."""
+
+        self._assert_step8_routes("workday", {
+            "crowdstrike": (
+                "https://crowdstrike.wd5.myworkdayjobs.com/wday/cxs/"
+                "crowdstrike/crowdstrikecareers/jobs"
+            ),
+            "mastercard": (
+                "https://mastercard.wd1.myworkdayjobs.com/wday/cxs/"
+                "mastercard/CorporateCareers/jobs"
+            ),
+        })
+
+    def test_step8_batch2_comeet_routes_group_one(self) -> None:
+        """Pin the first eight production-verified Comeet routes."""
+
+        self._assert_step8_routes("comeet", {
+            "buildots": "https://www.comeet.com/jobs/buildots/36.004",
+            "vi_labs": "https://www.comeet.com/jobs/vi/B1.002",
+            "automat_it": "https://www.comeet.com/jobs/automatit/26.003",
+            "sentra": "https://www.comeet.com/jobs/sentra/87.00B",
+            "tastewise": "https://www.comeet.com/jobs/tastewise/F8.000",
+            "shopic": "https://www.comeet.com/jobs/shopic/E6.002",
+            "cheq": "https://www.comeet.com/jobs/cheq/65.005",
+            "guardio": "https://www.comeet.com/jobs/guardio/57.000",
+        })
+
+    def test_step8_batch2_comeet_routes_group_two(self) -> None:
+        """Pin the next eight production-verified Comeet routes."""
+
+        self._assert_step8_routes("comeet", {
+            "zenity": "https://www.comeet.com/jobs/zenity/19.000",
+            "upstream_security": "https://www.comeet.com/jobs/upstream/E4.003",
+            "orchid_security": (
+                "https://www.comeet.com/jobs/orchid_security/4A.001"
+            ),
+            "onyx_security": (
+                "https://www.comeet.com/jobs/onyxsecurity/BA.005"
+            ),
+            "surecomp": "https://www.comeet.com/jobs/Surecomp/24.00E",
+            "rapid_medical": (
+                "https://www.comeet.com/jobs/rapidmedical/5A.003"
+            ),
+            "landa_digital_printing": (
+                "https://www.comeet.com/jobs/landacorp/A4.000"
+            ),
+            "att_israel": "https://www.comeet.com/jobs/joinattil/38.00A",
+        })
+
+    def test_step8_batch2_comeet_routes_group_three(self) -> None:
+        """Pin the remaining active production-verified Comeet routes."""
+
+        self._assert_step8_routes("comeet", {
+            "blinkops": "https://www.comeet.com/jobs/blinkops/C7.004",
+            "finubit": "https://www.comeet.com/jobs/finubit/A9.002",
+            "plaee": "https://www.comeet.com/jobs/plaee/5B.004",
+            "retym": "https://www.comeet.com/jobs/retym/C6.003",
+            "majestic_labs": (
+                "https://www.comeet.com/jobs/majesticlabs/AA.004"
+            ),
+            "shield_financial": (
+                "https://www.comeet.com/jobs/shieldfc/A5.00E"
+            ),
+        })
+
+    def test_step8_batch2_greenhouse_routes_group_one(self) -> None:
+        """Pin the first eight production-verified Greenhouse routes."""
+
+        self._assert_step8_routes("greenhouse", {
+            "innovid": (
+                "https://boards-api.greenhouse.io/v1/boards/innovid/"
+                "jobs?content=true"
+            ),
+            "beamup": (
+                "https://boards-api.greenhouse.io/v1/boards/beamup/"
+                "jobs?content=true"
+            ),
+            "credible": (
+                "https://boards-api.greenhouse.io/v1/boards/credible/"
+                "jobs?content=true"
+            ),
+            "nift": (
+                "https://boards-api.greenhouse.io/v1/boards/nift/"
+                "jobs?content=true"
+            ),
+            "guidde": (
+                "https://boards-api.greenhouse.io/v1/boards/guidde/"
+                "jobs?content=true"
+            ),
+            "unframe": (
+                "https://boards-api.greenhouse.io/v1/boards/unframe/"
+                "jobs?content=true"
+            ),
+            "honeycomb_insurance": (
+                "https://boards-api.greenhouse.io/v1/boards/"
+                "honeycombinsurance/jobs?content=true"
+            ),
+            "sweet_security": (
+                "https://boards-api.greenhouse.io/v1/boards/"
+                "sweetsecurity/jobs?content=true"
+            ),
+        })
+
+    def test_step8_batch2_greenhouse_routes_group_two(self) -> None:
+        """Pin the other seven production-verified Greenhouse routes."""
+
+        self._assert_step8_routes("greenhouse", {
+            "obligo": (
+                "https://boards-api.greenhouse.io/v1/boards/obligo/"
+                "jobs?content=true"
+            ),
+            "oasis_security": (
+                "https://boards-api.greenhouse.io/v1/boards/"
+                "oasissecurity/jobs?content=true"
+            ),
+            "conifers_ai": (
+                "https://boards-api.greenhouse.io/v1/boards/"
+                "conifersaicareers/jobs?content=true"
+            ),
+            "connecteam": (
+                "https://boards-api.greenhouse.io/v1/boards/connecteam/"
+                "jobs?content=true"
+            ),
+            "doit": (
+                "https://boards-api.greenhouse.io/v1/boards/doitintl/"
+                "jobs?content=true"
+            ),
+            "electreon": (
+                "https://boards-api.greenhouse.io/v1/boards/electreon/"
+                "jobs?content=true"
+            ),
+            "capitolis": (
+                "https://boards-api.greenhouse.io/v1/boards/capitolis/"
+                "jobs?content=true"
+            ),
+        })
+
+    def test_step8_batch2_ashby_routes(self) -> None:
+        """Pin the eight production-verified Ashby routes."""
+
+        self._assert_step8_routes("ashby", {
+            "unit": "https://api.ashbyhq.com/posting-api/job-board/unit",
+            "chainalysis": (
+                "https://api.ashbyhq.com/posting-api/job-board/"
+                "chainalysis-careers"
+            ),
+            "nexxen": "https://api.ashbyhq.com/posting-api/job-board/nexxen",
+            "airwallex": (
+                "https://api.ashbyhq.com/posting-api/job-board/airwallex"
+            ),
+            "viz_ai": "https://api.ashbyhq.com/posting-api/job-board/Viz.ai",
+            "april_tax": "https://api.ashbyhq.com/posting-api/job-board/april",
+            "beach_bum": (
+                "https://api.ashbyhq.com/posting-api/job-board/beach-bum"
+            ),
+            "loora": "https://api.ashbyhq.com/posting-api/job-board/loora",
+        })
+
+    def test_step8_batch2_workable_routes(self) -> None:
+        """Pin the three production-verified Workable accounts."""
+
+        self._assert_step8_routes("workable", {
+            "autofleet": (
+                "https://apply.workable.com/api/v3/accounts/autofleet/jobs"
+            ),
+            "tomax": "https://apply.workable.com/api/v3/accounts/tomax/jobs",
+            "nuvei": "https://apply.workable.com/api/v3/accounts/nuvei/jobs",
+        })
+
+    def test_step8_batch2_lever_routes(self) -> None:
+        """Pin the production-verified Cloudinary Lever route."""
+
+        self._assert_step8_routes("lever", {
+            "cloudinary": (
+                "https://api.lever.co/v0/postings/cloudinary?mode=json"
+            ),
+        })
+
+    def test_step8_batch3_ashby_routes_group_one(self) -> None:
+        """Pin the first nine relevance-gated Ashby routes."""
+
+        self._assert_step8_routes("ashby", {
+            "ledge": "https://api.ashbyhq.com/posting-api/job-board/ledge",
+            "tavily": "https://api.ashbyhq.com/posting-api/job-board/tavily",
+            "pointfive": (
+                "https://api.ashbyhq.com/posting-api/job-board/pointfive"
+            ),
+            "enclave_ai": (
+                "https://api.ashbyhq.com/posting-api/job-board/enclave"
+            ),
+            "glow": "https://api.ashbyhq.com/posting-api/job-board/glow",
+            "vivid": "https://api.ashbyhq.com/posting-api/job-board/vivid",
+            "sweep": "https://api.ashbyhq.com/posting-api/job-board/sweep",
+            "pi_security": (
+                "https://api.ashbyhq.com/posting-api/job-board/pi-security"
+            ),
+            "zafran_security": (
+                "https://api.ashbyhq.com/posting-api/job-board/zafran-security"
+            ),
+        })
+
+    def test_step8_batch3_ashby_routes_group_two(self) -> None:
+        """Pin the remaining eight relevance-gated Ashby routes."""
+
+        self._assert_step8_routes("ashby", {
+            "irregular": (
+                "https://api.ashbyhq.com/posting-api/job-board/irregular"
+            ),
+            "human_security": (
+                "https://api.ashbyhq.com/posting-api/job-board/HUMAN"
+            ),
+            "reindeer_ai": (
+                "https://api.ashbyhq.com/posting-api/job-board/reindeer-ai"
+            ),
+            "lumana": "https://api.ashbyhq.com/posting-api/job-board/lumana",
+            "echo_ai": "https://api.ashbyhq.com/posting-api/job-board/echo.ai",
+            "shapes": "https://api.ashbyhq.com/posting-api/job-board/shapes",
+            "act_security": (
+                "https://api.ashbyhq.com/posting-api/job-board/act-security"
+            ),
+            "matia": "https://api.ashbyhq.com/posting-api/job-board/matia",
+        })
+
+    def test_step8_batch3_greenhouse_routes(self) -> None:
+        """Pin the five relevance-gated Greenhouse routes."""
+
+        self._assert_step8_routes("greenhouse", {
+            "myheritage": (
+                "https://boards-api.greenhouse.io/v1/boards/myheritage/"
+                "jobs?content=true"
+            ),
+            "orion_security": (
+                "https://boards-api.greenhouse.io/v1/boards/"
+                "orioncscybersecurityltd/jobs?content=true"
+            ),
+            "navan": (
+                "https://boards-api.greenhouse.io/v1/boards/tripactions/"
+                "jobs?content=true"
+            ),
+            "speechify": (
+                "https://boards-api.greenhouse.io/v1/boards/speechify/"
+                "jobs?content=true"
+            ),
+            "venn": (
+                "https://boards-api.greenhouse.io/v1/boards/venncity/"
+                "jobs?content=true"
+            ),
+        })
+
+    def test_step8_batch3_lever_route(self) -> None:
+        """Pin the relevance-gated Palantir Lever route."""
+
+        self._assert_step8_routes("lever", {
+            "palantir": "https://api.lever.co/v0/postings/palantir?mode=json",
+        })
+
+    def test_step8_batch3_smartrecruiters_routes(self) -> None:
+        """Pin the two relevance-gated SmartRecruiters routes."""
+
+        self._assert_step8_routes("smartrecruiters", {
+            "nexar": (
+                "https://api.smartrecruiters.com/v1/companies/"
+                "NexarInc/postings"
+            ),
+            "nielseniq": (
+                "https://api.smartrecruiters.com/v1/companies/"
+                "NielsenIQ/postings"
+            ),
+        })
+
+    def test_step8_batch4_greenhouse_routes(self) -> None:
+        """Pin the two final-batch Greenhouse routes."""
+
+        self._assert_step8_routes("greenhouse", {
+            "playtika": (
+                "https://boards-api.greenhouse.io/v1/boards/playtikaltd/"
+                "jobs?content=true"
+            ),
+            "tomorrow_io": (
+                "https://boards-api.greenhouse.io/v1/boards/tomorrow/"
+                "jobs?content=true"
+            ),
+        })
+
+    def test_step8_batch4_ashby_route(self) -> None:
+        """Pin the final-batch Snowflake Ashby route."""
+
+        self._assert_step8_routes("ashby", {
+            "snowflake": (
+                "https://api.ashbyhq.com/posting-api/job-board/snowflake"
+            ),
+        })
+
+    def test_step8_batch4_comeet_routes(self) -> None:
+        """Pin the six final-batch Comeet routes."""
+
+        self._assert_step8_routes("comeet", {
+            "earnix": "https://www.comeet.com/jobs/earnix/93.00B",
+            "riverside": "https://www.comeet.com/jobs/riverside-fm/66.009",
+            "scytale": "https://www.comeet.com/jobs/scytale/2A.009",
+            "nova": "https://www.comeet.com/jobs/nova/A5.007",
+            "nanox": "https://www.comeet.com/jobs/nanox/43.00F",
+            "minute_media": "https://www.comeet.com/jobs/minute/45.00A",
+        })
+
+    def test_tenengroup_is_inactive_for_catalog_relevance(self) -> None:
+        """Keep a non-tech retailer out of active scans."""
+
+        tenengroup = self.companies["tenengroup"]
+        self.assertFalse(tenengroup["is_active"])
+        self.assertIn("relevance", tenengroup["notes"].casefold())
+
+    def test_wolt_operations_board_is_repaired_or_inactive(self) -> None:
+        """Never treat Wolt's warehouse board as its engineering feed."""
+
+        wolt = self.companies["wolt_israel"]
+        old_operations_board = (
+            "https://boards-api.greenhouse.io/v1/boards/woltisrael/"
+            "jobs?content=true"
+        )
+        self.assertTrue(
+            not wolt["is_active"] or wolt["api_url"] != old_operations_board
+        )
+        self.assertIn("engineering", wolt["notes"].casefold())
+
+    def test_no_facet_workday_companies_include_israeli_office_cities(
+        self,
+    ) -> None:
+        """Allow city-only fallback results through location filtering."""
+
+        expected_cities = {
+            "bmc_software": {"Tel Aviv", "Tel Hai", "Tel-Hai"},
+            "microchip_technology": {
+                "Hod Hasharon",
+                "Raanana",
+                "Ra'anana",
+            },
+        }
+        for company_id, city_names in expected_cities.items():
+            with self.subTest(company_id=company_id):
+                location_filters = set(
+                    self.companies[company_id]["location_filters"]
+                )
+                self.assertIn("Israel", location_filters)
+                self.assertTrue(city_names.issubset(location_filters))
+
+    def test_iai_uses_hidden_json_api(self) -> None:
+        """Route IAI through its current first-party JSON feed."""
+
+        company = self.companies["iai"]
+        self.assertEqual(company["ats_type"], "custom")
+        self.assertEqual(company["fetch_strategy"], "api")
+        self.assertEqual(
+            company["api_url"],
+            (
+                "https://jobs.iai.co.il/wp-content/themes/tyco-wp/"
+                "assets/json/jobs.json"
+            ),
+        )
+
+    def test_amdocs_uses_pcsx_search_api(self) -> None:
+        """Route Amdocs through its custom API adapter, not DOM scraping.
+
+        The careers page is another Eightfold-family SPA whose job list
+        never reaches the DOM (confirmed live), so this is fetched
+        directly instead.
+        """
+
+        company = self.companies["amdocs"]
+        self.assertEqual(company["ats_type"], "custom")
+        self.assertEqual(company["fetch_strategy"], "api")
+        self.assertEqual(
+            company["api_url"],
+            "https://jobs.amdocs.com/api/pcsx/search",
+        )
+        self.assertNotIn("job_selector", company)
+
+    def test_oracle_and_akamai_use_oracle_rc_api(self) -> None:
+        """Route both ORC tenants through the shared generic REST adapter.
+
+        Akamai's own careers frontend is WAF-blocked (confirmed live,
+        hard 403), but its Oracle Recruiting Cloud backend lives on a
+        completely different oraclecloud.com host and is unaffected.
+        """
+
+        for company_id, site_number in (
+            ("oracle", "CX_45001"),
+            ("akamai", "CX_1"),
+        ):
+            with self.subTest(company_id=company_id):
+                company = self.companies[company_id]
+                self.assertEqual(
+                    company["ats_type"], "oracle_recruiting_cloud"
+                )
+                self.assertEqual(company["fetch_strategy"], "api")
+                self.assertIn("oraclecloud.com", company["api_url"])
+                self.assertEqual(
+                    company["oracle_site_number"], site_number
+                )
+                self.assertTrue(company["oracle_careers_url"])
+
+    def test_elbit_uses_first_party_json_feed(self) -> None:
+        """Route Elbit through its custom API adapter, not DOM scraping.
+
+        The recruitment page is a Next.js shell whose job list never reaches
+        the DOM as anchors (confirmed live), so this is fetched directly.
+        """
+
+        company = self.companies["elbit_systems"]
+        self.assertEqual(company["ats_type"], "custom")
+        self.assertEqual(company["fetch_strategy"], "api")
+        self.assertEqual(
+            company["api_url"],
+            "https://elbitsystemscareer.com/cron/jobs.json",
+        )
+        self.assertNotIn("job_selector", company)
+
+    def test_synopsys_uses_async_result_anchor(self) -> None:
+        """Wait for actual job anchors without relying on a stale class."""
+
+        company = self.companies["synopsys"]
+        self.assertEqual(
+            company["job_selector"],
+            "#search-results-list a[data-job-id]",
+        )
+
+    def test_embedded_greenhouse_companies_use_public_api(self) -> None:
+        """Bypass marketing-page iframes through official board APIs."""
+
+        board_tokens = {
+            "cato_networks": "catonetworks",
+            "orca_security": "orcasecurity",
+            "wiz": "wizinc",
+        }
+        for company_id, board_token in board_tokens.items():
+            with self.subTest(company_id=company_id):
+                company = self.companies[company_id]
+                self.assertEqual(company["ats_type"], "greenhouse")
+                self.assertEqual(company["fetch_strategy"], "api")
+                self.assertEqual(
+                    company["api_url"],
+                    (
+                        "https://boards-api.greenhouse.io/v1/boards/"
+                        f"{board_token}/jobs?content=true"
+                    ),
+                )
+
+    def test_cyera_uses_title_bearing_job_cards(self) -> None:
+        """Select Cyera cards containing both the title field and job link."""
+
+        company = self.companies["cyera"]
+        self.assertEqual(
+            company["job_selector"],
+            (
+                "div.positions_item:has([fs-list-field='itemTitle'])"
+                ":has(a[href*='comeet.com/jobs/cyera/'])"
+            ),
+        )
+
+    def test_dealhub_uses_current_job_rows(self) -> None:
+        """Select DealHub rows containing the title, location, and job link."""
+
+        company = self.companies["dealhub"]
+        self.assertEqual(company["ats_type"], "custom")
+        self.assertEqual(company["fetch_strategy"], "browser")
+        self.assertEqual(
+            company["job_selector"],
+            ".careers-comeet-jobs__job-row",
+        )
+
+    def test_phenom_companies_use_strict_job_listing_selectors(self) -> None:
+        """Route browser Phenom sites to real job cards only."""
+
+        expected_configs = {
+            "palo_alto_networks": {
+                "api_url": (
+                    "https://jobs.paloaltonetworks.com/en/early-in-career"
+                ),
+                "job_selector": "a[data-job-id][href*='/job/']",
+            },
+            "servicenow": {
+                "api_url": (
+                    "https://careers.servicenow.com/jobs/"
+                    "?search=&jobPostingType=Early+Career"
+                    "&pagesize=20#results"
+                ),
+                "job_selector": (
+                    "div.card.card-job:has("
+                    "h2.card-title > a.stretched-link.js-view-job)"
+                ),
+            },
+            "intuit": {
+                "api_url": (
+                    "https://jobs.intuit.com/search-jobs"
+                    "?acm=9205024%2C9205760%2C9205744"
+                    "&alrpm=ALL"
+                    "&ascf=%5B%7B%22key%22%3A%22ALL%22%2C"
+                    "%22value%22%3A%22%22%7D%5D"
+                ),
+                "job_selector": "a[data-job-id][href*='/job/']",
+            },
+        }
+        for company_id, expected in expected_configs.items():
+            with self.subTest(company_id=company_id):
+                company = self.companies[company_id]
+                self.assertEqual(company["ats_type"], "phenom")
+                self.assertEqual(company["fetch_strategy"], "browser")
+                self.assertEqual(company["api_url"], expected["api_url"])
+                self.assertEqual(
+                    company["job_selector"],
+                    expected["job_selector"],
+                )
+                self.assertEqual(company["selector_timeout_ms"], 25_000)
+
+    def test_imperva_uses_scoped_thales_widgets_api(self) -> None:
+        """Route Imperva through the backend that honors country facets."""
+
+        company = self.companies["imperva_thales"]
+        self.assertEqual(company["ats_type"], "custom")
+        self.assertEqual(company["fetch_strategy"], "api")
+        self.assertEqual(
+            company["api_url"],
+            "https://careers.thalesgroup.com/widgets",
+        )
+        self.assertNotIn("job_selector", company)
+
+    def test_meta_uses_network_interception_search_page(self) -> None:
+        """Keep Meta on the page that emits its private GraphQL search."""
+
+        company = self.companies["meta"]
+        self.assertEqual(company["ats_type"], "meta_custom")
+        self.assertEqual(company["fetch_strategy"], "browser")
+        self.assertEqual(
+            company["api_url"],
+            "https://www.metacareers.com/jobs?q=Israel",
+        )
+
+    def test_google_uses_embedded_data_base_url(self) -> None:
+        """Keep pagination queries out of Google's configured base URL."""
+
+        company = self.companies["google"]
+        self.assertEqual(company["ats_type"], "google_custom")
+        self.assertEqual(company["fetch_strategy"], "browser")
+        self.assertEqual(
+            company["api_url"],
+            (
+                "https://www.google.com/about/careers/"
+                "applications/jobs/results"
+            ),
+        )
+
+
+class ScraperAdapterTests(unittest.TestCase):
+    """Verify adapter transport bounds and factual content extraction."""
+
+    def test_meta_parser_normalizes_graphql_jobs(self) -> None:
+        """Normalize Meta's nested GraphQL result into shared job records."""
+
+        payload = {
+            "data": {
+                "job_search_with_featured_jobs_v2": {
+                    "all_jobs": [
+                        {
+                            "id": "123456789",
+                            "title": "Software Engineer, University Grad",
+                            "locations": ["Tel Aviv, Israel"],
+                            "teams": ["Infrastructure", "AI Research"],
+                        }
+                    ]
+                }
+            }
+        }
+
+        jobs = custom_adapters._meta_job_search_parser(payload)
+
+        self.assertEqual(
+            jobs,
+            [
+                {
+                    "id": "meta_123456789",
+                    "title": "Software Engineer, University Grad",
+                    "location": "Tel Aviv, Israel",
+                    "url": (
+                        "https://www.metacareers.com/jobs/123456789"
+                    ),
+                    "content": "Infrastructure, AI Research",
+                }
+            ],
+        )
+
+    def test_meta_parser_joins_locations_for_downstream_filter(self) -> None:
+        """Keep secondary Meta locations visible to location filtering."""
+
+        payload = {
+            "data": {
+                "job_search_with_featured_jobs_v2": {
+                    "all_jobs": [
+                        {
+                            "id": "multi-location",
+                            "title": "Software Engineer, University Grad",
+                            "locations": [
+                                "London, UK",
+                                "Tel Aviv, Israel",
+                            ],
+                            "teams": [],
+                        }
+                    ]
+                }
+            }
+        }
+
+        jobs = custom_adapters._meta_job_search_parser(payload)
+
+        self.assertEqual(
+            jobs[0]["location"],
+            "London, UK, Tel Aviv, Israel",
+        )
+        self.assertTrue(
+            scraper.is_in_location(jobs[0]["location"], ["Israel"])
+        )
+
+    def test_meta_parser_ignores_malformed_jobs(self) -> None:
+        """Return only complete Meta records from a partially bad payload."""
+
+        payload = {
+            "data": {
+                "job_search_with_featured_jobs_v2": {
+                    "all_jobs": [
+                        {"id": "missing-title", "locations": []},
+                        "not-an-object",
+                    ]
+                }
+            }
+        }
+
+        self.assertEqual(
+            custom_adapters._meta_job_search_parser(payload),
+            [],
+        )
+        self.assertEqual(
+            custom_adapters._meta_job_search_parser({"data": {}}),
+            [],
+        )
+
+    def test_meta_adapter_uses_passive_graphql_interception(self) -> None:
+        """Load Meta's search page and parse observed POST responses."""
+
+        company = {
+            "company_id": "meta",
+            "company_name": "Meta Israel",
+            "ats_type": "meta_custom",
+            "fetch_strategy": "browser",
+            "api_url": "https://www.metacareers.com/jobs?q=Israel",
+        }
+        expected_jobs = [{
+            "id": "meta_123",
+            "title": "University Grad Engineer",
+            "location": "Tel Aviv, Israel",
+            "url": "https://www.metacareers.com/jobs/123",
+            "content": "Infrastructure",
+        }]
+        with patch(
+            "scrapers.browser.custom_adapters.NetworkInterceptScraper"
+        ) as scraper_class:
+            scraper_class.return_value.scrape.return_value = ScrapeResult(
+                status=ScrapeStatus.SUCCESS,
+                jobs=expected_jobs,
+            )
+
+            result = custom_adapters.scrape_meta(company)
+
+        self.assertEqual(result.status, ScrapeStatus.SUCCESS)
+        self.assertEqual(result.jobs, expected_jobs)
+        scraper_class.return_value.scrape.assert_called_once_with(
+            company=company,
+            target_url_pattern="/graphql",
+            response_parser_fn=custom_adapters._meta_job_search_parser,
+            request_method="POST",
+        )
+
+    def test_meta_custom_routes_to_registered_adapter(self) -> None:
+        """Dispatch Meta through interception instead of DOM heuristics."""
+
+        company = {
+            **self._company("meta_custom"),
+            "fetch_strategy": "browser",
+        }
+        expected_jobs = [{"id": "meta_123"}]
+        expected = ScrapeResult(
+            status=ScrapeStatus.SUCCESS,
+            jobs=expected_jobs,
+        )
+        adapter = MagicMock(return_value=expected)
+        with (
+            patch.dict(
+                scraper.CUSTOM_BROWSER_ADAPTERS,
+                {"meta_custom": adapter},
+            ),
+            patch("builtins.print"),
+        ):
+            result = scraper.fetch_jobs_from_company(company)
+
+        self.assertIs(result, expected)
+        adapter.assert_called_once_with(company)
+
+    def test_google_text_reads_second_list_item_only(self) -> None:
+        """Read Google's HTML-bearing pair without guessing other shapes."""
+
+        self.assertEqual(
+            custom_adapters._google_text([None, "<p>Job details</p>"]),
+            "<p>Job details</p>",
+        )
+        self.assertEqual(custom_adapters._google_text(["only-one"]), "")
+        self.assertEqual(custom_adapters._google_text("plain text"), "")
+
+    def test_google_parser_maps_fields_and_skips_malformed_jobs(self) -> None:
+        """Normalize positional Google data while isolating bad records."""
+
+        valid_job: list[object] = [None] * 20
+        valid_job[0] = 12345
+        valid_job[1] = "Software Engineering Intern"
+        valid_job[2] = "https://www.google.com/about/careers/jobs/12345"
+        valid_job[3] = [None, "<p>Job description</p>"]
+        valid_job[4] = [None, "<p>Minimum qualifications</p>"]
+        valid_job[9] = [
+            ["Tel Aviv, Israel", "IL"],
+            ["Haifa, Israel", "IL"],
+        ]
+        valid_job[10] = [None, "<p>Responsibilities</p>"]
+        valid_job[19] = [None, "must not be included"]
+
+        with patch(
+            "scrapers.browser.custom_adapters.LOGGER.warning"
+        ) as warning:
+            jobs = custom_adapters._google_job_parser(
+                [["malformed", valid_job]]
+            )
+
+        self.assertEqual(
+            jobs,
+            [{
+                "id": "google_12345",
+                "title": "Software Engineering Intern",
+                "location": "Tel Aviv, Israel, Haifa, Israel",
+                "url": (
+                    "https://www.google.com/about/careers/jobs/12345"
+                ),
+                "content": (
+                    "<p>Job description</p>\n\n"
+                    "<p>Minimum qualifications</p>\n\n"
+                    "<p>Responsibilities</p>"
+                ),
+            }],
+        )
+        self.assertNotIn("must not be included", jobs[0]["content"])
+        warning.assert_called_once()
+
+    def test_google_parser_handles_missing_location_list(self) -> None:
+        """Use an empty location when Google's positional field is absent."""
+
+        job: list[object] = [None] * 11
+        job[0] = "no-location"
+        job[1] = "Early Career Software Engineer"
+        job[2] = "https://example.test/jobs/no-location"
+        job[3] = [None, "Description"]
+        job[4] = [None, "Qualifications"]
+        job[9] = None
+        job[10] = [None, "Responsibilities"]
+
+        jobs = custom_adapters._google_job_parser([[job]])
+
+        self.assertEqual(jobs[0]["location"], "")
+
+    def test_google_adapter_paginates_variants_and_deduplicates(self) -> None:
+        """Fetch both Google variants until empty and preserve first IDs."""
+
+        company = {
+            "company_id": "google",
+            "company_name": "Google Israel",
+            "ats_type": "google_custom",
+            "fetch_strategy": "browser",
+            "api_url": (
+                "https://www.google.com/about/careers/"
+                "applications/jobs/results"
+            ),
+        }
+        early_job = {
+            "id": "google_early",
+            "title": "Early Career Engineer",
+            "location": "Israel",
+            "url": "https://example.test/jobs/early",
+            "content": "Early career",
+        }
+        shared_early_job = {
+            "id": "google_shared",
+            "title": "Shared Role - Early Variant",
+            "location": "Israel",
+            "url": "https://example.test/jobs/shared",
+            "content": "First occurrence",
+        }
+        shared_intern_job = {
+            **shared_early_job,
+            "title": "Shared Role - Intern Variant",
+            "content": "Duplicate occurrence",
+        }
+        intern_job = {
+            "id": "google_intern",
+            "title": "Software Engineering Intern",
+            "location": "Tel Aviv, Israel",
+            "url": "https://example.test/jobs/intern",
+            "content": "Internship",
+        }
+
+        with patch(
+            "scrapers.browser.custom_adapters.EmbeddedJsonScraper"
+        ) as scraper_class:
+            scraper_class.return_value.scrape.side_effect = [
+                ScrapeResult(
+                    status=ScrapeStatus.SUCCESS,
+                    jobs=[early_job, shared_early_job],
+                ),
+                ScrapeResult(status=ScrapeStatus.NO_JOBS, jobs=[]),
+                ScrapeResult(
+                    status=ScrapeStatus.SUCCESS,
+                    jobs=[shared_intern_job, intern_job],
+                ),
+                ScrapeResult(status=ScrapeStatus.SUCCESS, jobs=[]),
+            ]
+
+            result = custom_adapters.scrape_google(company)
+
+        self.assertEqual(result.status, ScrapeStatus.SUCCESS)
+        self.assertEqual(
+            result.jobs,
+            [early_job, shared_early_job, intern_job],
+        )
+        scraper_class.assert_called_once_with()
+        base_url = company["api_url"]
+        self.assertEqual(
+            scraper_class.return_value.scrape.call_args_list,
+            [
+                call(
+                    company={
+                        **company,
+                        "api_url": (
+                            f"{base_url}?location=Israel"
+                            "&target_level=EARLY&page=1"
+                        ),
+                    },
+                    data_parser_fn=custom_adapters._google_job_parser,
+                    write_diagnostics=True,
+                ),
+                call(
+                    company={
+                        **company,
+                        "api_url": (
+                            f"{base_url}?location=Israel"
+                            "&target_level=EARLY&page=2"
+                        ),
+                    },
+                    data_parser_fn=custom_adapters._google_job_parser,
+                    write_diagnostics=False,
+                ),
+                call(
+                    company={
+                        **company,
+                        "api_url": (
+                            f"{base_url}?location=Israel"
+                            "&employment_type=INTERN&page=1"
+                        ),
+                    },
+                    data_parser_fn=custom_adapters._google_job_parser,
+                    write_diagnostics=False,
+                ),
+                call(
+                    company={
+                        **company,
+                        "api_url": (
+                            f"{base_url}?location=Israel"
+                            "&employment_type=INTERN&page=2"
+                        ),
+                    },
+                    data_parser_fn=custom_adapters._google_job_parser,
+                    write_diagnostics=False,
+                ),
+            ],
+        )
+
+    def test_google_adapter_caps_each_query_variant(self) -> None:
+        """Stop each Google query independently at the safety limit."""
+
+        company = {
+            "company_id": "google",
+            "api_url": (
+                "https://www.google.com/about/careers/"
+                "applications/jobs/results"
+            ),
+        }
+        repeated_job = {
+            "id": "google_repeated",
+            "title": "Early Career Engineer",
+            "location": "Israel",
+            "url": "https://example.test/jobs/repeated",
+            "content": "Repeated across pages",
+        }
+
+        with (
+            patch(
+                "scrapers.browser.custom_adapters.EmbeddedJsonScraper"
+            ) as scraper_class,
+            patch.object(
+                custom_adapters,
+                "GOOGLE_MAX_PAGES_PER_VARIANT",
+                2,
+            ),
+            patch(
+                "scrapers.browser.custom_adapters.LOGGER.warning"
+            ) as warning,
+        ):
+            scraper_class.return_value.scrape.return_value = ScrapeResult(
+                status=ScrapeStatus.SUCCESS,
+                jobs=[repeated_job],
+            )
+
+            result = custom_adapters.scrape_google(company)
+
+        self.assertEqual(result.status, ScrapeStatus.SUCCESS)
+        self.assertEqual(result.jobs, [repeated_job])
+        self.assertEqual(
+            scraper_class.return_value.scrape.call_count,
+            4,
+        )
+        self.assertEqual(warning.call_count, 2)
+        called_urls = [
+            item.kwargs["company"]["api_url"]
+            for item in scraper_class.return_value.scrape.call_args_list
+        ]
+        self.assertFalse(any("page=3" in url for url in called_urls))
+
+    def test_google_adapter_preserves_waf_blocked_status(self) -> None:
+        """Do not collapse a typed browser block into an empty result."""
+
+        blocked = ScrapeResult(
+            status=ScrapeStatus.WAF_BLOCKED,
+            jobs=[],
+            message="challenge page",
+        )
+        with patch(
+            "scrapers.browser.custom_adapters.EmbeddedJsonScraper"
+        ) as scraper_class:
+            scraper_class.return_value.scrape.return_value = blocked
+            result = custom_adapters.scrape_google(
+                self._company("google_custom")
+            )
+
+        self.assertEqual(result.status, ScrapeStatus.WAF_BLOCKED)
+        self.assertEqual(result.jobs, [])
+        self.assertEqual(result.message, "challenge page")
+
+    def test_google_custom_routes_to_registered_adapter(self) -> None:
+        """Dispatch Google through embedded extraction instead of DOM rules."""
+
+        company = {
+            **self._company("google_custom"),
+            "fetch_strategy": "browser",
+        }
+        expected_jobs = [{"id": "google_123"}]
+        expected = ScrapeResult(
+            status=ScrapeStatus.SUCCESS,
+            jobs=expected_jobs,
+        )
+        adapter = MagicMock(return_value=expected)
+        with (
+            patch.dict(
+                scraper.CUSTOM_BROWSER_ADAPTERS,
+                {"google_custom": adapter},
+            ),
+            patch("builtins.print"),
+        ):
+            result = scraper.fetch_jobs_from_company(company)
+
+        self.assertIs(result, expected)
+        adapter.assert_called_once_with(company)
+
+    def test_greenhouse_extracts_actual_content_with_timeout(self) -> None:
+        """Read Greenhouse content instead of synthesizing a description."""
+
+        response = MagicMock()
+        response.json.return_value = {
+            "jobs": [
+                {
+                    "id": 123,
+                    "title": "Student Developer - Israel",
+                    "location": {"name": "Tel Aviv, Israel"},
+                    "absolute_url": (
+                        "https://example.test/jobs/israel/123"
+                    ),
+                    "content": (
+                        "<p>Build Python services.</p>"
+                        "<p>Requires two semesters.</p>"
+                    ),
+                }
+            ]
+        }
+        with (
+            patch(
+                "scrapers.api.client.requests.get",
+                return_value=response,
+            ) as get,
+            patch("builtins.print"),
+        ):
+            result = scraper.fetch_jobs_from_company(
+                self._company("greenhouse")
+            )
+
+        get.assert_called_once_with(
+            "https://example.test/api",
+            headers=api_client.DEFAULT_REQUEST_HEADERS,
+            timeout=15,
+        )
+        self.assertEqual(result.status, ScrapeStatus.SUCCESS)
+        self.assertEqual(result.jobs[0]["url"], (
+            "https://example.test/jobs/israel/123"
+        ))
+        self.assertIn("Build Python services.", result.jobs[0]["content"])
+        self.assertNotIn("description", result.jobs[0])
+        self.assertNotIn(
+            "Full job description available at:",
+            result.jobs[0]["content"],
+        )
+
+    def test_every_requests_ats_uses_fifteen_second_timeout(self) -> None:
+        """Bound Workday, Amazon, SmartRecruiters, and Ashby requests."""
+
+        response = MagicMock()
+        response.json.return_value = {}
+
+        with (
+            patch(
+                "scrapers.api.client.requests.post",
+                return_value=response,
+            ) as post,
+            patch("builtins.print"),
+        ):
+            scraper.fetch_jobs_from_company(self._company("workday"))
+        self.assertEqual(post.call_args.kwargs["timeout"], 15)
+
+        for ats_type in ("amazon_jobs", "smartrecruiters", "ashby"):
+            with self.subTest(ats_type=ats_type):
+                with (
+                    patch(
+                        "scrapers.api.client.requests.get",
+                        return_value=response,
+                    ) as get,
+                    patch("builtins.print"),
+                ):
+                    scraper.fetch_jobs_from_company(
+                        self._company(ats_type)
+                    )
+                self.assertEqual(get.call_args.kwargs["timeout"], 15)
+
+    def test_workday_enriches_empty_location_from_job_detail(self) -> None:
+        """Recover a requisition location omitted from the search listing."""
+
+        discovery_response = MagicMock()
+        discovery_response.json.return_value = {"facets": []}
+        listing_response = MagicMock()
+        listing_response.json.return_value = {
+            "total": 2,
+            "jobPostings": [
+                {
+                    "title": "Marketing Communication Manager",
+                    "locationsText": "",
+                    "externalPath": "/job/example_R20033",
+                    "bulletFields": ["R20033"],
+                },
+                {},
+            ],
+        }
+        detail_response = MagicMock()
+        detail_response.json.return_value = {
+            "jobPostingInfo": {
+                "location": "",
+                "jobRequisitionLocation": {
+                    "descriptor": "Italy Remote",
+                },
+            }
+        }
+        company = {
+            "company_id": "example",
+            "ats_type": "workday",
+            "api_url": (
+                "https://example.wd1.myworkdayjobs.com/wday/cxs/"
+                "example/External/jobs"
+            ),
+            "location_filters": ["Israel"],
+        }
+
+        with (
+            patch(
+                "scrapers.api.client.requests.post",
+                side_effect=[discovery_response, listing_response],
+            ),
+            patch(
+                "scrapers.api.client.requests.get",
+                return_value=detail_response,
+            ) as get,
+        ):
+            result = api_client.fetch_ats_jobs(
+                company,
+                scraper.ATS_FIELD_MAP["workday"],
+            )
+
+        get.assert_called_once()
+        self.assertEqual(
+            get.call_args.args[0],
+            "https://example.wd1.myworkdayjobs.com/wday/cxs/"
+            "example/External/job/example_R20033",
+        )
+        self.assertEqual(get.call_args.kwargs["timeout"], 15)
+        self.assertEqual(len(result.jobs), 1)
+        self.assertEqual(result.jobs[0]["id"], "example_R20033")
+        self.assertEqual(result.jobs[0]["location"], "Italy Remote")
+
+    def test_successfactors_request_uses_timeout(self) -> None:
+        """Bound the HTML adapter request."""
+
+        response = MagicMock()
+        response.text = "<html></html>"
+        with patch(
+            "scrapers.browser.custom_adapters.requests.get",
+            return_value=response,
+        ) as get:
+            custom_adapters.scrape_successfactors(
+                self._company("successfactors")
+            )
+
+        self.assertEqual(get.call_args.kwargs["timeout"], 15)
+
+    def test_http_adapters_classify_blocking_statuses(self) -> None:
+        """Map 401, 403, and 429 consistently across HTTP adapters."""
+
+        adapters = (
+            (
+                "iai",
+                custom_adapters.scrape_iai,
+                {"company_id": "iai", "api_url": "https://x.test/jobs"},
+                "get",
+            ),
+            (
+                "elbit",
+                custom_adapters.scrape_elbit,
+                {"company_id": "elbit", "api_url": "https://x.test/jobs"},
+                "get",
+            ),
+            (
+                "amdocs",
+                custom_adapters.scrape_amdocs,
+                {"company_id": "amdocs", "api_url": "https://x.test/jobs"},
+                "get",
+            ),
+            (
+                "oracle_rc",
+                custom_adapters.scrape_oracle_rc,
+                {
+                    "company_id": "oracle",
+                    "api_url": "https://x.test/jobs",
+                    "oracle_site_number": "CX_1",
+                },
+                "get",
+            ),
+            (
+                "thales_phenom",
+                custom_adapters.scrape_thales_phenom,
+                {"company_id": "thales", "api_url": "https://x.test/jobs"},
+                "post",
+            ),
+            (
+                "successfactors",
+                custom_adapters.scrape_successfactors,
+                {"company_id": "sap", "api_url": "https://x.test/jobs"},
+                "get",
+            ),
+            (
+                "workable",
+                custom_adapters.scrape_workable,
+                {
+                    "company_id": "example",
+                    "api_url": (
+                        "https://apply.workable.com/api/v3/accounts/"
+                        "example/jobs"
+                    ),
+                },
+                "post",
+            ),
+        )
+
+        for adapter_name, adapter, company, method in adapters:
+            for status_code in (401, 403, 429):
+                with self.subTest(
+                    adapter=adapter_name,
+                    status_code=status_code,
+                ):
+                    response = MagicMock(status_code=status_code)
+                    error = custom_adapters.requests.HTTPError(
+                        f"HTTP {status_code}",
+                        response=response,
+                    )
+                    request_path = (
+                        "scrapers.browser.custom_adapters.requests."
+                        f"{method}"
+                    )
+                    with (
+                        patch(request_path, side_effect=error),
+                        patch(
+                            "scrapers.browser.custom_adapters."
+                            "write_company_artifacts"
+                        ),
+                    ):
+                        result = adapter(company)
+
+                    self.assertEqual(
+                        result.status,
+                        ScrapeStatus.WAF_BLOCKED,
+                    )
+                    self.assertEqual(result.jobs, [])
+                    self.assertIn(str(status_code), result.message)
+
+    def test_iai_normalizes_hidden_json_feed(self) -> None:
+        """Extract IAI's compact array fields into the shared job schema."""
+
+        response = MagicMock()
+        response.json.return_value = [
+            {
+                "id": 76049533,
+                "tl": "Student Software Engineer",
+                "ct": "Beer Yaakov",
+                "dc": "Develop real-time C++ systems.",
+            },
+            "ignore non-object entries",
+            {"id": 123, "ct": "Lod"},
+        ]
+        company = {
+            "company_id": "iai",
+            "company_name": "Israel Aerospace Industries (IAI)",
+            "ats_type": "custom",
+            "fetch_strategy": "api",
+            "api_url": (
+                "https://jobs.iai.co.il/wp-content/themes/tyco-wp/"
+                "assets/json/jobs.json"
+            ),
+        }
+
+        with patch(
+            "scrapers.browser.custom_adapters.requests.get",
+            return_value=response,
+        ) as get:
+            result = custom_adapters.scrape_iai(company)
+
+        response.raise_for_status.assert_called_once_with()
+        self.assertEqual(get.call_args.args[0], company["api_url"])
+        self.assertEqual(get.call_args.kwargs["timeout"], 15)
+        self.assertIn("User-Agent", get.call_args.kwargs["headers"])
+        self.assertEqual(result.status, ScrapeStatus.SUCCESS)
+        self.assertEqual(
+            result.jobs,
+            [
+                {
+                    "id": "iai_76049533",
+                    "title": "Student Software Engineer",
+                    "location": "Beer Yaakov",
+                    "url": "https://jobs.iai.co.il/job/76049533/",
+                    "content": "Develop real-time C++ systems.",
+                }
+            ],
+        )
+
+    def test_iai_custom_api_routes_to_registered_adapter(self) -> None:
+        """Dispatch IAI's custom API instead of silently returning no jobs."""
+
+        company = {
+            "company_id": "iai",
+            "company_name": "Israel Aerospace Industries (IAI)",
+            "ats_type": "custom",
+            "fetch_strategy": "api",
+            "api_url": "https://jobs.iai.co.il/jobs.json",
+        }
+        expected_jobs = [{"id": "iai_76049533"}]
+        expected = ScrapeResult(
+            status=ScrapeStatus.SUCCESS,
+            jobs=expected_jobs,
+        )
+        adapter = MagicMock(return_value=expected)
+
+        with (
+            patch.dict(
+                scraper.CUSTOM_API_ADAPTERS,
+                {"iai": adapter},
+            ),
+            patch("builtins.print"),
+        ):
+            result = scraper.fetch_jobs_from_company(company)
+
+        self.assertIs(result, expected)
+        adapter.assert_called_once_with(company)
+
+    def test_elbit_normalizes_first_party_json_feed(self) -> None:
+        """Extract Elbit's cron/jobs.json feed into the shared job schema."""
+
+        response = MagicMock()
+        response.json.return_value = [
+            {
+                "jobId": 20839,
+                "jobTitle": "Electronics Development Engineer",
+                "area": "Shfela",
+                "description": (
+                    "&lt;div&gt;Design multidisciplinary systems.&lt;/div&gt;"
+                    "&lt;div&gt;&lt;br&gt;&lt;/div&gt;"
+                ),
+            },
+            "ignore non-object entries",
+            {"jobId": 1, "area": "North"},  # missing title, skipped
+            {"jobTitle": "No id", "area": "Center"},  # missing id, skipped
+            {"jobId": 2, "jobTitle": "No area listed", "area": None},
+        ]
+        company = {
+            "company_id": "elbit_systems",
+            "company_name": "Elbit Systems",
+            "ats_type": "custom",
+            "fetch_strategy": "api",
+            "api_url": "https://elbitsystemscareer.com/cron/jobs.json",
+        }
+
+        with patch(
+            "scrapers.browser.custom_adapters.requests.get",
+            return_value=response,
+        ) as get:
+            result = custom_adapters.scrape_elbit(company)
+
+        response.raise_for_status.assert_called_once_with()
+        self.assertEqual(get.call_args.args[0], company["api_url"])
+        self.assertEqual(get.call_args.kwargs["timeout"], 15)
+        self.assertIn("User-Agent", get.call_args.kwargs["headers"])
+        self.assertEqual(result.status, ScrapeStatus.SUCCESS)
+        self.assertEqual(
+            result.jobs,
+            [
+                {
+                    "id": "elbit_systems_20839",
+                    "title": "Electronics Development Engineer",
+                    "location": "Shfela",
+                    "url": (
+                        "https://elbitsystemscareer.com/Recruitment-Page/"
+                        "?jobId=20839"
+                    ),
+                    "content": "Design multidisciplinary systems.",
+                },
+                {
+                    "id": "elbit_systems_2",
+                    "title": "No area listed",
+                    "location": "",
+                    "url": (
+                        "https://elbitsystemscareer.com/Recruitment-Page/"
+                        "?jobId=2"
+                    ),
+                    "content": "",
+                },
+            ],
+        )
+
+    def test_elbit_requires_api_url(self) -> None:
+        """Fail closed instead of guessing an endpoint."""
+
+        with patch(
+            "scrapers.browser.custom_adapters.requests.get",
+        ) as get:
+            result = custom_adapters.scrape_elbit(
+                {"company_id": "elbit_systems"}
+            )
+
+        get.assert_not_called()
+        self.assertEqual(result.status, ScrapeStatus.FAILED)
+        self.assertEqual(result.jobs, [])
+
+    def test_elbit_rejects_non_list_payload(self) -> None:
+        """Tolerate an unexpected feed shape without raising."""
+
+        response = MagicMock()
+        response.json.return_value = {"unexpected": "shape"}
+        company = {
+            "company_id": "elbit_systems",
+            "api_url": "https://elbitsystemscareer.com/cron/jobs.json",
+        }
+
+        with patch(
+            "scrapers.browser.custom_adapters.requests.get",
+            return_value=response,
+        ):
+            result = custom_adapters.scrape_elbit(company)
+
+        self.assertEqual(result.status, ScrapeStatus.FAILED)
+        self.assertEqual(result.jobs, [])
+
+    def test_elbit_custom_api_routes_to_registered_adapter(self) -> None:
+        """Dispatch Elbit's custom API instead of the browser fallback."""
+
+        company = {
+            "company_id": "elbit_systems",
+            "company_name": "Elbit Systems",
+            "ats_type": "custom",
+            "fetch_strategy": "api",
+            "api_url": "https://elbitsystemscareer.com/cron/jobs.json",
+        }
+        expected_jobs = [{"id": "elbit_systems_20839"}]
+        expected = ScrapeResult(
+            status=ScrapeStatus.SUCCESS,
+            jobs=expected_jobs,
+        )
+        adapter = MagicMock(return_value=expected)
+
+        with (
+            patch.dict(
+                scraper.CUSTOM_API_ADAPTERS,
+                {"elbit_systems": adapter},
+            ),
+            patch("builtins.print"),
+        ):
+            result = scraper.fetch_jobs_from_company(company)
+
+        self.assertIs(result, expected)
+        adapter.assert_called_once_with(company)
+
+    def test_amdocs_paginates_via_start_offset_and_builds_urls(self) -> None:
+        """Page through pcsx/search unconditionally, no location filter.
+
+        The frontend's own location=israel param returns zero results even
+        from a real authenticated browser session (verified live), so this
+        fetches the domain unconditionally and relies on the orchestrator's
+        location_filters to scope results downstream.
+        """
+
+        first_response = MagicMock()
+        first_response.json.return_value = {
+            "data": {
+                "positions": [
+                    {
+                        "id": 563431014700743,
+                        "name": "Category Manager, Strategic Sourcing",
+                        "standardizedLocations": ["Miami, FL, US"],
+                        "positionUrl": "/careers/job/563431014700743",
+                    },
+                    {
+                        "id": 563431014721199,
+                        "name": "Student Developer",
+                        "standardizedLocations": ["Ra'anana, Israel"],
+                        "positionUrl": "/careers/job/563431014721199",
+                    },
+                ]
+                * 5  # 10 positions: a full first page
+            }
+        }
+        second_response = MagicMock()
+        second_response.json.return_value = {"data": {"positions": []}}
+        company = {
+            "company_id": "amdocs",
+            "ats_type": "custom",
+            "fetch_strategy": "api",
+            "api_url": "https://jobs.amdocs.com/api/pcsx/search",
+        }
+
+        with patch(
+            "scrapers.browser.custom_adapters.requests.get",
+            side_effect=[first_response, second_response],
+        ) as get:
+            result = custom_adapters.scrape_amdocs(company)
+
+        self.assertEqual(get.call_count, 2)
+        self.assertEqual(get.call_args_list[0].kwargs["params"]["start"], 0)
+        self.assertEqual(get.call_args_list[1].kwargs["params"]["start"], 10)
+        self.assertEqual(result.status, ScrapeStatus.SUCCESS)
+        jobs = result.jobs
+        self.assertEqual(len(jobs), 2)  # deduped by id, 5x repeats collapse
+        self.assertEqual(
+            jobs[0],
+            {
+                "id": "amdocs_563431014700743",
+                "title": "Category Manager, Strategic Sourcing",
+                "location": "Miami, FL, US",
+                "url": "https://jobs.amdocs.com/careers/job/563431014700743",
+                "content": "",
+            },
+        )
+        self.assertEqual(jobs[1]["location"], "Ra'anana, Israel")
+
+    def test_amdocs_requires_api_url(self) -> None:
+        """Fail closed instead of guessing an endpoint."""
+
+        with patch(
+            "scrapers.browser.custom_adapters.requests.get",
+        ) as get:
+            result = custom_adapters.scrape_amdocs(
+                {"company_id": "amdocs"}
+            )
+
+        get.assert_not_called()
+        self.assertEqual(result.status, ScrapeStatus.FAILED)
+        self.assertEqual(result.jobs, [])
+
+    def test_amdocs_custom_api_routes_to_registered_adapter(self) -> None:
+        """Dispatch Amdocs' custom API instead of the browser fallback."""
+
+        company = {
+            "company_id": "amdocs",
+            "ats_type": "custom",
+            "fetch_strategy": "api",
+            "api_url": "https://jobs.amdocs.com/api/pcsx/search",
+        }
+        expected_jobs = [{"id": "amdocs_1"}]
+        expected = ScrapeResult(
+            status=ScrapeStatus.SUCCESS,
+            jobs=expected_jobs,
+        )
+        adapter = MagicMock(return_value=expected)
+
+        with (
+            patch.dict(
+                scraper.CUSTOM_API_ADAPTERS,
+                {"amdocs": adapter},
+            ),
+            patch("builtins.print"),
+        ):
+            result = scraper.fetch_jobs_from_company(company)
+
+        self.assertIs(result, expected)
+        adapter.assert_called_once_with(company)
+
+    def test_oracle_rc_paginates_by_offset_and_joins_locations(self) -> None:
+        """Page a generic ORC tenant via offset and stop at TotalJobsCount.
+
+        A full first page (matching ORC_PAGE_SIZE exactly) must trigger a
+        second request; the mock data reflects that instead of an
+        unrealistically short first page.
+        """
+
+        first_page_requisitions = [
+            {
+                "Id": f"{300000 + index}",
+                "Title": f"Engineer {index}",
+                "PrimaryLocation": "PETACH TIKVA, Israel",
+                "secondaryLocations": [],
+                "ShortDescriptionStr": "",
+            }
+            for index in range(custom_adapters.ORC_PAGE_SIZE)
+        ]
+        first_page_requisitions[0] = {
+            "Id": "342302",
+            "Title": "Program Management VP",
+            "PrimaryLocation": "PETACH TIKVA, Israel",
+            "secondaryLocations": [
+                {"Name": "Tel Aviv, Israel"},
+                {"Name": "PETACH TIKVA, Israel"},
+            ],
+            "ShortDescriptionStr": "Lead cloud operations.",
+        }
+        total_jobs = custom_adapters.ORC_PAGE_SIZE + 1
+
+        first_response = MagicMock()
+        first_response.json.return_value = {
+            "items": [{
+                "TotalJobsCount": total_jobs,
+                "requisitionList": first_page_requisitions,
+            }]
+        }
+        second_response = MagicMock()
+        second_response.json.return_value = {
+            "items": [{
+                "TotalJobsCount": total_jobs,
+                "requisitionList": [
+                    {
+                        "Id": "340882",
+                        "Title": "Senior Site Reliability Engineer",
+                        "PrimaryLocation": "PETACH TIKVA, Israel",
+                    },
+                ],
+            }]
+        }
+        company = {
+            "company_id": "oracle",
+            "ats_type": "oracle_recruiting_cloud",
+            "fetch_strategy": "api",
+            "api_url": (
+                "https://eeho.fa.us2.oraclecloud.com/hcmRestApi/"
+                "resources/latest/recruitingCEJobRequisitions"
+            ),
+            "oracle_site_number": "CX_45001",
+            "oracle_careers_url": (
+                "https://careers.oracle.com/en/sites/jobsearch/job/"
+            ),
+            "location_filters": ["Israel", "Petah Tikva"],
+        }
+
+        with patch(
+            "scrapers.browser.custom_adapters.requests.get",
+            side_effect=[first_response, second_response],
+        ) as get:
+            result = custom_adapters.scrape_oracle_rc(company)
+
+        self.assertEqual(get.call_count, 2)
+        self.assertIn(
+            "keyword=Israel",
+            get.call_args_list[0].kwargs["params"]["finder"],
+        )
+        self.assertIn(
+            "siteNumber=CX_45001",
+            get.call_args_list[0].kwargs["params"]["finder"],
+        )
+        self.assertIn(
+            f"offset={custom_adapters.ORC_PAGE_SIZE}",
+            get.call_args_list[1].kwargs["params"]["finder"],
+        )
+        self.assertEqual(
+            len(result.jobs),
+            custom_adapters.ORC_PAGE_SIZE + 1,
+        )
+        self.assertEqual(result.status, ScrapeStatus.SUCCESS)
+        jobs = result.jobs
+        self.assertEqual(jobs[-1]["id"], "oracle_340882")
+        self.assertEqual(
+            jobs[0]["location"],
+            "PETACH TIKVA, Israel, Tel Aviv, Israel",
+        )
+        self.assertEqual(
+            jobs[0]["url"],
+            "https://careers.oracle.com/en/sites/jobsearch/job/342302",
+        )
+        self.assertEqual(jobs[0]["content"], "Lead cloud operations.")
+        self.assertEqual(jobs[1]["content"], "")
+
+    def test_oracle_rc_requires_site_number(self) -> None:
+        """Fail closed without a tenant site number to scope the finder."""
+
+        with patch(
+            "scrapers.browser.custom_adapters.requests.get",
+        ) as get:
+            result = custom_adapters.scrape_oracle_rc({
+                "company_id": "akamai",
+                "api_url": "https://fa-extu-saasfaprod1.fa.ocs.oraclecloud.com/x",
+            })
+
+        get.assert_not_called()
+        self.assertEqual(result.status, ScrapeStatus.FAILED)
+        self.assertEqual(result.jobs, [])
+
+    def test_oracle_rc_defaults_keyword_to_israel_without_location_filters(
+        self,
+    ) -> None:
+        """Default the finder keyword when a company has no filters set."""
+
+        response = MagicMock()
+        response.json.return_value = {"items": [{"requisitionList": []}]}
+        company = {
+            "company_id": "akamai",
+            "api_url": "https://fa-extu-saasfaprod1.fa.ocs.oraclecloud.com/x",
+            "oracle_site_number": "CX_1",
+        }
+
+        with patch(
+            "scrapers.browser.custom_adapters.requests.get",
+            return_value=response,
+        ) as get:
+            custom_adapters.scrape_oracle_rc(company)
+
+        self.assertIn(
+            "keyword=Israel",
+            get.call_args.kwargs["params"]["finder"],
+        )
+
+    def test_oracle_recruiting_cloud_routes_to_registered_adapter(
+        self,
+    ) -> None:
+        """Dispatch any ORC tenant through the shared generic adapter."""
+
+        company = {
+            "company_id": "akamai",
+            "company_name": "Akamai Israel",
+            "ats_type": "oracle_recruiting_cloud",
+            "fetch_strategy": "api",
+            "api_url": "https://fa-extu-saasfaprod1.fa.ocs.oraclecloud.com/x",
+            "oracle_site_number": "CX_1",
+        }
+        expected_jobs = [{"id": "akamai_1"}]
+        expected = ScrapeResult(
+            status=ScrapeStatus.SUCCESS,
+            jobs=expected_jobs,
+        )
+        adapter = MagicMock(return_value=expected)
+
+        with (
+            patch.dict(
+                scraper.CUSTOM_API_ADAPTERS_BY_ATS_TYPE,
+                {"oracle_recruiting_cloud": adapter},
+            ),
+            patch("builtins.print"),
+        ):
+            result = scraper.fetch_jobs_from_company(company)
+
+        self.assertIs(result, expected)
+        adapter.assert_called_once_with(company)
+
+    def test_thales_adapter_scopes_israel_and_paginates(self) -> None:
+        """Normalize every Israel page and reject foreign contamination."""
+
+        first_response = MagicMock()
+        first_response.json.return_value = {
+            "refineSearch": {
+                "totalHits": 3,
+                "data": {
+                    "jobs": [
+                        {
+                            "jobId": "R100",
+                            "title": "Student C++ Engineer",
+                            "country": "Israel",
+                            "cityStateCountry": "Rehovot, Israel",
+                            "location": "Rehovot, 7670212",
+                            "address": (
+                                "Perkeris Street 2, Rehovot, Israel"
+                            ),
+                            "applyUrl": (
+                                "https://thales.example/jobs/R100/apply"
+                            ),
+                            "descriptionTeaser": (
+                                "Develop networking software."
+                            ),
+                        },
+                        {
+                            "jobId": "R200",
+                            "title": "Graduate Engineer",
+                            "country": "France",
+                            "cityStateCountry": "Paris, France",
+                            "applyUrl": (
+                                "https://thales.example/jobs/R200/apply"
+                            ),
+                        },
+                    ]
+                },
+            }
+        }
+        second_response = MagicMock()
+        second_response.json.return_value = {
+            "refineSearch": {
+                "totalHits": 3,
+                "data": {
+                    "jobs": [
+                        {
+                            "jobId": "R300",
+                            "title": "Junior Software Engineer",
+                            "country": "Israel",
+                            "cityStateCountry": "Tel Aviv, Israel",
+                            "location": "Tel Aviv, 67010",
+                            "applyUrl": (
+                                "https://thales.example/jobs/R300/apply"
+                            ),
+                            "descriptionTeaser": (
+                                "Build application-security systems."
+                            ),
+                        }
+                    ]
+                },
+            }
+        }
+        company = {
+            "company_id": "imperva_thales",
+            "ats_type": "custom",
+            "fetch_strategy": "api",
+            "api_url": "https://careers.thalesgroup.com/widgets",
+        }
+
+        with patch(
+            "scrapers.browser.custom_adapters.requests.post",
+            side_effect=[first_response, second_response],
+        ) as post:
+            result = custom_adapters.scrape_thales_phenom(company)
+
+        self.assertEqual(result.status, ScrapeStatus.SUCCESS)
+        jobs = result.jobs
+        self.assertEqual(
+            [job["id"] for job in jobs],
+            ["imperva_thales_R100", "imperva_thales_R300"],
+        )
+        self.assertEqual(jobs[0]["title"], "Student C++ Engineer")
+        self.assertIn("Rehovot, Israel", jobs[0]["location"])
+        self.assertEqual(
+            jobs[0]["url"],
+            "https://thales.example/jobs/R100/apply",
+        )
+        self.assertEqual(
+            jobs[0]["content"],
+            "Develop networking software.",
+        )
+        self.assertEqual(post.call_count, 2)
+        first_payload = post.call_args_list[0].kwargs["json"]
+        second_payload = post.call_args_list[1].kwargs["json"]
+        self.assertEqual(
+            first_payload["selected_fields"],
+            {"country": ["Israel"]},
+        )
+        self.assertEqual(first_payload["from"], 0)
+        self.assertEqual(second_payload["from"], 2)
+        self.assertEqual(post.call_args.kwargs["timeout"], 15)
+        self.assertIn("User-Agent", post.call_args.kwargs["headers"])
+
+    def test_imperva_custom_api_routes_to_registered_adapter(self) -> None:
+        """Dispatch Imperva through the scoped Thales API adapter."""
+
+        self.assertIs(
+            scraper.CUSTOM_API_ADAPTERS["imperva_thales"],
+            custom_adapters.scrape_thales_phenom,
+        )
+
+    def test_successfactors_missing_location_stays_unknown(self) -> None:
+        """Do not fabricate Israel when a SuccessFactors row has no location."""
+
+        response = MagicMock()
+        response.text = (
+            '<table><tr class="data-row">'
+            '<span class="jobTitle">'
+            '<a href="/jobs/123/">Student Engineer</a>'
+            "</span></tr></table>"
+        )
+        with patch(
+            "scrapers.browser.custom_adapters.requests.get",
+            return_value=response,
+        ):
+            result = custom_adapters.scrape_successfactors(
+                self._company("successfactors")
+            )
+
+        self.assertEqual(result.status, ScrapeStatus.SUCCESS)
+        self.assertEqual(len(result.jobs), 1)
+        self.assertEqual(result.jobs[0]["location"], "")
+
+    def test_universal_playwright_preserves_typed_result(self) -> None:
+        """Do not discard a typed browser failure at the wrapper seam."""
+
+        expected = ScrapeResult(
+            status=ScrapeStatus.WAF_BLOCKED,
+            jobs=[],
+            message="Cloudflare challenge",
+        )
+        playwright_scraper = MagicMock()
+        playwright_scraper.scrape.return_value = expected
+        with patch(
+            "scrapers.browser.custom_adapters.PlaywrightJobScraper",
+            return_value=playwright_scraper,
+        ):
+            result = custom_adapters.scrape_universal_playwright(
+                self._company("custom")
+            )
+
+        self.assertIs(result, expected)
+
+    def test_eightfold_extracts_native_jobs_with_timeout(self) -> None:
+        """Normalize a native Eightfold response without using Playwright."""
+
+        response = MagicMock()
+        response.json.return_value = {
+            "data": {
+                "positions": [
+                    {
+                        "id": 123,
+                        "name": "Student Software Engineer",
+                        "location": {
+                            "city": "Tel Aviv",
+                            "country": "Israel",
+                        },
+                        "canonicalPositionUrl": "/careers/job/123",
+                        "description": (
+                            "<p>Build cloud security services.</p>"
+                        ),
+                    }
+                ]
+            }
+        }
+        career_url = (
+            "https://example.eightfold.ai/careers?query=israel"
+        )
+        with (
+            patch(
+                "scrapers.browser.custom_adapters.requests.get",
+                return_value=response,
+            ) as get,
+            patch(
+                "scrapers.browser.custom_adapters."
+                "scrape_universal_playwright"
+            ) as fallback,
+        ):
+            result = custom_adapters.scrape_eightfold(
+                "palo_alto_networks",
+                career_url,
+            )
+
+        self.assertEqual(
+            get.call_args.args[0],
+            "https://example.eightfold.ai/api/apply/v2/jobs",
+        )
+        self.assertEqual(get.call_args.kwargs["timeout"], 15)
+        fallback.assert_not_called()
+        self.assertEqual(result.status, ScrapeStatus.SUCCESS)
+        self.assertEqual(result.jobs[0]["id"], "palo_alto_networks_123")
+        self.assertEqual(result.jobs[0]["location"], "Tel Aviv, Israel")
+        self.assertEqual(
+            result.jobs[0]["url"],
+            "https://example.eightfold.ai/careers/job/123",
+        )
+        self.assertEqual(
+            result.jobs[0]["content"],
+            "Build cloud security services.",
+        )
+
+    def test_eightfold_falls_back_to_universal_playwright(self) -> None:
+        """Use the original career page when the native API is unavailable."""
+
+        expected = ScrapeResult(
+            status=ScrapeStatus.WAF_BLOCKED,
+            jobs=[],
+            message="Cloudflare challenge",
+        )
+        career_url = "https://jobs.paloaltonetworks.com/en/search-jobs"
+        with (
+            patch(
+                "scrapers.browser.custom_adapters.requests.get",
+                side_effect=custom_adapters.requests.ConnectionError(
+                    "API unavailable"
+                ),
+            ),
+            patch(
+                "scrapers.browser.custom_adapters."
+                "scrape_universal_playwright",
+                return_value=expected,
+            ) as fallback,
+        ):
+            result = custom_adapters.scrape_eightfold(
+                "palo_alto_networks",
+                career_url,
+            )
+
+        self.assertIs(result, expected)
+        fallback.assert_called_once_with(
+            {
+                "company_id": "palo_alto_networks",
+                "api_url": career_url,
+            }
+        )
+
+    def test_eightfold_ats_routes_to_adapter(self) -> None:
+        """Route Eightfold companies instead of reporting them unsupported."""
+
+        company = self._company("eightfold")
+        with (
+            patch(
+                "scrapers.orchestrator.scrape_eightfold",
+                return_value=ScrapeResult(
+                    status=ScrapeStatus.SUCCESS,
+                    jobs=[{"id": "example_123"}],
+                ),
+            ) as eightfold,
+            patch("builtins.print"),
+        ):
+            result = scraper.fetch_jobs_from_company(company)
+
+        self.assertEqual(result.status, ScrapeStatus.SUCCESS)
+        self.assertEqual(result.jobs, [{"id": "example_123"}])
+        eightfold.assert_called_once_with(
+            "example",
+            "https://example.test/api",
+        )
+
+    def test_microsoft_ats_routes_to_universal_playwright(self) -> None:
+        """Route Microsoft through the universal Playwright adapter."""
+
+        company = {
+            **self._company("microsoft_custom"),
+            "fetch_strategy": "browser",
+        }
+        expected = ScrapeResult(
+            status=ScrapeStatus.SUCCESS,
+            jobs=[{"id": "example_123"}],
+        )
+        with (
+            patch(
+                "scrapers.orchestrator.scrape_universal_playwright",
+                return_value=expected,
+            ) as universal_playwright,
+            patch("builtins.print"),
+        ):
+            result = scraper.fetch_jobs_from_company(company)
+
+        self.assertIs(result, expected)
+        universal_playwright.assert_called_once_with(company)
+
+    def test_dispatch_seam_preserves_typed_adapter_failures(self) -> None:
+        """Return a migrated adapter's status and context unchanged."""
+
+        company = {
+            **self._company("comeet"),
+            "fetch_strategy": "api",
+        }
+        expected = ScrapeResult(
+            status=ScrapeStatus.WAF_BLOCKED,
+            jobs=[],
+            message="HTTP 403",
+        )
+        adapter = MagicMock(return_value=expected)
+        with patch.dict(
+            scraper.CUSTOM_API_ADAPTERS_BY_ATS_TYPE,
+            {"comeet": adapter},
+        ):
+            result = scraper.fetch_jobs_from_company(company)
+
+        self.assertIs(result, expected)
+        adapter.assert_called_once_with(company)
+
+    def test_dispatch_seam_preserves_typed_no_jobs_result(self) -> None:
+        """Return a native no-jobs outcome without rebuilding it."""
+
+        company = {
+            **self._company("microsoft_custom"),
+            "fetch_strategy": "browser",
+        }
+        expected = ScrapeResult(status=ScrapeStatus.NO_JOBS, jobs=[])
+        with patch(
+            "scrapers.orchestrator.scrape_universal_playwright",
+            return_value=expected,
+        ):
+            result = scraper.fetch_jobs_from_company(company)
+
+        self.assertIs(result, expected)
+
+    def test_unknown_ats_emits_logging_warning(self) -> None:
+        """Make unsupported ATS types visible through standard logging."""
+
+        with patch("scrapers.orchestrator.LOGGER.warning") as warning:
+            result = scraper.fetch_jobs_from_company(
+                self._company("unsupported")
+            )
+
+        self.assertEqual(result.status, ScrapeStatus.FAILED)
+        self.assertEqual(result.jobs, [])
+        warning.assert_called_once()
+        self.assertIn(
+            "No adapter available",
+            warning.call_args.args[0],
+        )
+        self.assertIn("unsupported", warning.call_args.args)
+
+    @staticmethod
+    def _company(ats_type: str) -> dict[str, object]:
+        """Return a minimal company configuration for one adapter."""
+
+        return {
+            "company_id": "example",
+            "company_name": "Example",
+            "ats_type": ats_type,
+            "api_url": "https://example.test/api",
+        }
+
+
+class ComeetAdapterTests(unittest.TestCase):
+    """Verify the generalized Comeet adapter across its three embed shapes."""
+
+    def test_direct_board_parses_embedded_positions_data(self) -> None:
+        """Extract jobs from a board's inline COMPANY_POSITIONS_DATA array."""
+
+        html_response = MagicMock()
+        html_response.text = """
+        <html><script>
+        window.COMPANY_POSITIONS_DATA = [{
+            "name": "Student Software Engineer",
+            "uid": "34.C6F",
+            "location": {"city": "Ramat-Gan", "state": "Tel Aviv District", "name": "Israel"},
+            "url_active_page": "https://wsc-sports.com/career/student-swe/",
+            "url_comeet_hosted_page": "https://www.comeet.com/jobs/wsc-sports/93.007/x/34.C6F",
+            "custom_fields": {"details": [{"name": "Description", "value": "<p>Build things.</p>"}]}
+        }];
+        </script></html>
+        """
+        company = {
+            "company_id": "wsc_sports",
+            "api_url": "https://www.comeet.com/jobs/wsc-sports/93.007",
+        }
+
+        with patch(
+            "scrapers.browser.custom_adapters.requests.get",
+            return_value=html_response,
+        ) as get:
+            result = custom_adapters.scrape_comeet(company)
+
+        self.assertEqual(get.call_count, 1)
+        self.assertEqual(get.call_args.args[0], company["api_url"])
+        self.assertEqual(result.status, ScrapeStatus.SUCCESS)
+        self.assertEqual(
+            result.jobs,
+            [
+                {
+                    "id": "wsc_sports_34.C6F",
+                    "title": "Student Software Engineer",
+                    "location": "Ramat-Gan | Tel Aviv District | Israel",
+                    "url": "https://wsc-sports.com/career/student-swe/",
+                    "content": "Build things.",
+                }
+            ],
+        )
+
+    def test_js_widget_embed_derives_and_fetches_direct_board(self) -> None:
+        """Follow a COMEET.init widget's own company-name/uid to the board."""
+
+        widget_response = MagicMock()
+        widget_response.text = """
+        <script>
+        COMEET.init({"token": "X", "company-uid": "C0.008", "company-name": "Checkmarx"});
+        </script>
+        """
+        board_response = MagicMock()
+        board_response.text = """
+        window.COMPANY_POSITIONS_DATA = [{
+            "name": "AppSec Engineer", "uid": "78.66E",
+            "location": {"city": "Tel Aviv", "name": "Israel"},
+            "url_active_page": "https://checkmarx.com/jobs/78.66E",
+            "custom_fields": {}
+        }];
+        """
+        company = {"company_id": "checkmarx", "api_url": "https://checkmarx.com/company/careers/"}
+
+        with patch(
+            "scrapers.browser.custom_adapters.requests.get",
+            side_effect=[widget_response, board_response],
+        ) as get:
+            result = custom_adapters.scrape_comeet(company)
+
+        self.assertEqual(get.call_count, 2)
+        self.assertEqual(
+            get.call_args_list[1].args[0],
+            "https://www.comeet.com/jobs/checkmarx/C0.008",
+        )
+        self.assertEqual(result.status, ScrapeStatus.SUCCESS)
+        self.assertEqual(
+            result.jobs,
+            [
+                {
+                    "id": "checkmarx_78.66E",
+                    "title": "AppSec Engineer",
+                    "location": "Tel Aviv | Israel",
+                    "url": "https://checkmarx.com/jobs/78.66E",
+                    "content": "",
+                }
+            ],
+        )
+
+    def test_widget_falls_back_to_domain_slug_when_name_slug_has_no_data(
+        self,
+    ) -> None:
+        """Try a domain-derived slug when the display-name slug is wrong.
+
+        Confirmed live: Moon Active's widget declares "company-name":
+        "Moon Active", but the real Comeet slug is "moonactive" -- the
+        naive "moon-active" slug 302-redirects to Comeet's own homepage
+        (a 200 with no position data), not an error.
+        """
+
+        widget_response = MagicMock()
+        widget_response.text = """
+        <script>
+        COMEET.init({"token": "X", "company-uid": "A2.00C", "company-name": "Moon Active"});
+        </script>
+        """
+        wrong_slug_response = MagicMock()
+        wrong_slug_response.text = "<html>Comeet homepage, no position data here</html>"
+        right_slug_response = MagicMock()
+        right_slug_response.text = """
+        window.COMPANY_POSITIONS_DATA = [{
+            "name": "Game Designer", "uid": "11.111",
+            "location": {"name": "Israel"}, "url_active_page": "https://moonactive.com/jobs/11",
+            "custom_fields": {}
+        }];
+        """
+        company = {"company_id": "moon_active", "api_url": "https://www.moonactive.com/careers/"}
+
+        with patch(
+            "scrapers.browser.custom_adapters.requests.get",
+            side_effect=[widget_response, wrong_slug_response, right_slug_response],
+        ) as get:
+            result = custom_adapters.scrape_comeet(company)
+
+        self.assertEqual(get.call_count, 3)
+        self.assertEqual(
+            get.call_args_list[1].args[0],
+            "https://www.comeet.com/jobs/moon-active/A2.00C",
+        )
+        self.assertEqual(
+            get.call_args_list[2].args[0],
+            "https://www.comeet.com/jobs/moonactive/A2.00C",
+        )
+        self.assertEqual(result.status, ScrapeStatus.SUCCESS)
+        self.assertEqual(result.jobs[0]["id"], "moon_active_11.111")
+
+    def test_wordpress_plugin_dom_fallback_when_no_widget_or_data(self) -> None:
+        """DOM-scrape server-rendered positions from Comeet's WP plugin.
+
+        This embed shape (confirmed live on ChargeAfter) exposes neither
+        COMPANY_POSITIONS_DATA nor a COMEET.init widget -- positions are
+        rendered directly as .comeet-position elements with no separate
+        structured location or description field.
+        """
+
+        html_response = MagicMock()
+        html_response.text = """
+        <html><body>
+        <div class="comeet-position">
+            <a href="/careers/co/remote/41.B6E/customer-success">
+                <div class="comeet-position-name">Customer Success Manager</div>
+                <div class="comeet-position-meta">Remote | Full-time</div>
+            </a>
+        </div>
+        </body></html>
+        """
+        detail_response = MagicMock()
+        detail_response.text = (
+            '<span class="comeet-position-location">Remote</span>'
+        )
+        company = {"company_id": "chargeafter", "api_url": "https://chargeafter.com/careers/"}
+
+        with patch(
+            "scrapers.browser.custom_adapters.requests.get",
+            side_effect=[html_response, detail_response],
+        ):
+            result = custom_adapters.scrape_comeet(company)
+
+        self.assertEqual(result.status, ScrapeStatus.SUCCESS)
+        self.assertEqual(
+            result.jobs,
+            [
+                {
+                    "id": "chargeafter_41.B6E",
+                    "title": "Customer Success Manager",
+                    "location": "Remote",
+                    "url": "https://chargeafter.com/careers/co/remote/41.B6E/customer-success",
+                    "content": "",
+                }
+            ],
+        )
+
+    def test_wordpress_plugin_dom_fallback_when_position_is_the_anchor(
+        self,
+    ) -> None:
+        """Handle the WP-plugin shape where .comeet-position is itself <a>.
+
+        Confirmed live on Nuvoton: unlike ChargeAfter's wrapper-div-around-
+        an-anchor markup, some renders of this plugin put the href directly
+        on the ".comeet-position" element. A version of this adapter that
+        only looked for a *nested* anchor silently returned zero jobs here
+        despite genuine, correctly-rendered position data being present.
+        """
+
+        html_response = MagicMock()
+        html_response.text = """
+        <html><body>
+        <a class="comeet-position" href="https://nuvoton.co.il/careers/co/ai-npu/3B.969/lead">
+            <div class="comeet-position-name">Lead AI Engineer</div>
+            <div class="comeet-position-meta">Nuvoton-Herzliya | Full-time</div>
+        </a>
+        </body></html>
+        """
+        detail_response = MagicMock()
+        detail_response.text = (
+            '<span class="comeet-position-location">'
+            "Nuvoton-Herzliya"
+            "</span>"
+        )
+        company = {
+            "company_id": "nuvoton",
+            "api_url": "https://nuvoton.co.il/careers/",
+        }
+
+        with patch(
+            "scrapers.browser.custom_adapters.requests.get",
+            side_effect=[html_response, detail_response],
+        ):
+            result = custom_adapters.scrape_comeet(company)
+
+        self.assertEqual(result.status, ScrapeStatus.SUCCESS)
+        self.assertEqual(
+            result.jobs,
+            [
+                {
+                    "id": "nuvoton_3B.969",
+                    "title": "Lead AI Engineer",
+                    "location": "Nuvoton-Herzliya",
+                    "url": "https://nuvoton.co.il/careers/co/ai-npu/3B.969/lead",
+                    "content": "",
+                }
+            ],
+        )
+
+    def test_wordpress_detail_enrichment_is_bounded_concurrent(self) -> None:
+        """Fetch slow independent detail pages with a small bounded pool."""
+
+        listing_response = MagicMock()
+        listing_response.text = "".join(
+            f"""
+            <a class="comeet-position" href="/careers/co/team/{index}.ABC/job">
+                <div class="comeet-position-name">Role {index}</div>
+            </a>
+            """
+            for index in range(8)
+        )
+        detail_response = MagicMock()
+        detail_response.text = (
+            '<span class="comeet-position-location">Tel Aviv</span>'
+        )
+        lock = threading.Lock()
+        release_requests = threading.Event()
+        active_requests = 0
+        maximum_active_requests = 0
+
+        def get(url: str, **_kwargs: object) -> MagicMock:
+            nonlocal active_requests, maximum_active_requests
+            if url == "https://example.test/careers/":
+                return listing_response
+            with lock:
+                active_requests += 1
+                maximum_active_requests = max(
+                    maximum_active_requests,
+                    active_requests,
+                )
+                if active_requests >= 2:
+                    release_requests.set()
+            release_requests.wait(timeout=0.1)
+            with lock:
+                active_requests -= 1
+            return detail_response
+
+        with patch(
+            "scrapers.browser.custom_adapters.requests.get",
+            side_effect=get,
+        ):
+            result = custom_adapters.scrape_comeet({
+                "company_id": "example",
+                "api_url": "https://example.test/careers/",
+            })
+
+        self.assertEqual(result.status, ScrapeStatus.SUCCESS)
+        self.assertGreaterEqual(maximum_active_requests, 2)
+        self.assertLessEqual(maximum_active_requests, 4)
+        self.assertEqual(
+            {job["location"] for job in result.jobs},
+            {"Tel Aviv"},
+        )
+
+    def test_wordpress_explicit_location_skips_detail_enrichment(self) -> None:
+        """Do not fetch a detail page when listing location is authoritative."""
+
+        listing_response = MagicMock()
+        listing_response.text = """
+        <a class="comeet-position" href="/careers/co/team/11.ABC/job">
+            <div class="comeet-position-name">Data Engineer</div>
+            <div class="comeet-position-location">Ramat Gan, Israel</div>
+        </a>
+        """
+        with patch(
+            "scrapers.browser.custom_adapters.requests.get",
+            return_value=listing_response,
+        ) as get:
+            result = custom_adapters.scrape_comeet({
+                "company_id": "example",
+                "api_url": "https://example.test/careers/",
+            })
+
+        self.assertEqual(get.call_count, 1)
+        self.assertEqual(result.status, ScrapeStatus.SUCCESS)
+        self.assertEqual(result.jobs[0]["location"], "Ramat Gan, Israel")
+
+    def test_wordpress_geographic_groups_skip_detail_enrichment(self) -> None:
+        """Use authoritative location groups without per-job requests."""
+
+        listing_response = MagicMock()
+        listing_response.text = """
+        <div class="comeet-g-r">
+            <div class="comeet-group-name">Israel - Tel Aviv</div>
+            <a class="comeet-position" href="/careers/co/israel/11.ABC/job">
+                <div class="comeet-position-name">Data Engineer</div>
+            </a>
+        </div>
+        <div class="comeet-g-r">
+            <div class="comeet-group-name">US Remote</div>
+            <a class="comeet-position" href="/careers/co/us/22.ABC/job">
+                <div class="comeet-position-name">Sales Engineer</div>
+            </a>
+        </div>
+        <div class="comeet-g-r">
+            <div class="comeet-group-name">Korea</div>
+            <a class="comeet-position" href="/careers/co/korea/33.ABC/job">
+                <div class="comeet-position-name">Support Engineer</div>
+            </a>
+        </div>
+        """
+        with patch(
+            "scrapers.browser.custom_adapters.requests.get",
+            return_value=listing_response,
+        ) as get:
+            result = custom_adapters.scrape_comeet({
+                "company_id": "example",
+                "api_url": "https://example.test/careers/",
+            })
+
+        self.assertEqual(get.call_count, 1)
+        self.assertEqual(
+            [job["location"] for job in result.jobs],
+            ["Israel - Tel Aviv", "US Remote", "Korea"],
+        )
+
+    def test_wordpress_department_groups_still_use_detail_location(self) -> None:
+        """Do not mistake a department-grouped board for geography."""
+
+        listing_response = MagicMock()
+        listing_response.text = """
+        <div class="comeet-g-r">
+            <div class="comeet-group-name">Engineering</div>
+            <a class="comeet-position" href="/careers/co/engineering/11.ABC/job">
+                <div class="comeet-position-name">Data Engineer</div>
+            </a>
+        </div>
+        """
+        detail_response = MagicMock()
+        detail_response.text = (
+            '<span class="comeet-position-location">Tel Aviv, Israel</span>'
+        )
+        with patch(
+            "scrapers.browser.custom_adapters.requests.get",
+            side_effect=[listing_response, detail_response],
+        ) as get:
+            result = custom_adapters.scrape_comeet({
+                "company_id": "example",
+                "api_url": "https://example.test/careers/",
+            })
+
+        self.assertEqual(get.call_count, 2)
+        self.assertEqual(result.jobs[0]["location"], "Tel Aviv, Israel")
+
+    def test_position_missing_uid_or_title_is_skipped(self) -> None:
+        """Drop malformed entries instead of producing an empty-id record."""
+
+        html_response = MagicMock()
+        html_response.text = """
+        window.COMPANY_POSITIONS_DATA = [
+            {"name": "Valid Role", "uid": "11.111", "location": {}, "custom_fields": {}},
+            {"name": "", "uid": "22.222"},
+            {"uid": "33.333"},
+            {"name": "No UID Role"}
+        ];
+        """
+        company = {"company_id": "example", "api_url": "https://www.comeet.com/jobs/example/1"}
+
+        with patch(
+            "scrapers.browser.custom_adapters.requests.get",
+            return_value=html_response,
+        ):
+            result = custom_adapters.scrape_comeet(company)
+
+        self.assertEqual(result.status, ScrapeStatus.SUCCESS)
+        self.assertEqual(
+            [job["id"] for job in result.jobs],
+            ["example_11.111"],
+        )
+
+    def test_wordpress_dom_uses_detail_json_ld_location(self) -> None:
+        """Replace listing badges with the detail page's real location."""
+
+        listing_response = MagicMock()
+        listing_response.text = """
+        <a class="comeet-position"
+           href="/career/co/https-www-example-com-careers/11.111/data-engineer/all">
+            <div class="comeet-position-name">Data Engineer</div>
+            <div class="comeet-position-meta">Marketing · Full-time · Intermediate</div>
+        </a>
+        """
+        detail_response = MagicMock()
+        detail_response.text = """
+        <script type="application/ld+json">
+        {
+          "@type": "JobPosting",
+          "jobLocation": {
+            "@type": "Place",
+            "address": {
+              "addressLocality": "Tel Aviv-Yafo",
+              "addressRegion": "Tel Aviv District",
+              "addressCountry": {"name": "IL"}
+            }
+          }
+        }
+        </script>
+        """
+        company = {
+            "company_id": "example",
+            "api_url": "https://example.com/careers/",
+        }
+
+        with patch(
+            "scrapers.browser.custom_adapters.requests.get",
+            side_effect=[listing_response, detail_response],
+        ) as get:
+            result = custom_adapters.scrape_comeet(company)
+
+        self.assertEqual(get.call_count, 2)
+        self.assertEqual(result.status, ScrapeStatus.SUCCESS)
+        self.assertEqual(
+            result.jobs[0]["location"],
+            "Tel Aviv-Yafo | Tel Aviv District | IL",
+        )
+
+    def test_wordpress_dom_tolerates_invalid_json_ld_wrapper(self) -> None:
+        """Read location fields when unrelated JSON-LD has a trailing comma."""
+
+        listing_response = MagicMock()
+        listing_response.text = """
+        <a class="comeet-position"
+           href="/career/co/broken-category/22.222/data-engineer/all">
+            <div class="comeet-position-name">Data Engineer</div>
+            <div class="comeet-position-meta">Full-time</div>
+        </a>
+        """
+        detail_response = MagicMock()
+        detail_response.text = """
+        <script type="application/ld+json">
+        {
+          "@type": "JobPosting",
+          "hiringOrganization": {"name": "Example",},
+          "jobLocation": {
+            "address": {
+              "addressLocality": "Tel Aviv-Yafo",
+              "addressRegion": "Tel Aviv District",
+              "addressCountry": {"name": "IL"}
+            }
+          }
+        }
+        </script>
+        """
+        with patch(
+            "scrapers.browser.custom_adapters.requests.get",
+            side_effect=[listing_response, detail_response],
+        ):
+            result = custom_adapters.scrape_comeet(
+                {
+                    "company_id": "example",
+                    "api_url": "https://example.com/careers/",
+                }
+            )
+
+        self.assertEqual(
+            result.jobs[0]["location"],
+            "Tel Aviv-Yafo | Tel Aviv District | IL",
+        )
+
+    def test_wordpress_dom_reads_remote_country_requirement(self) -> None:
+        """Use applicantLocationRequirements for remote Comeet roles."""
+
+        listing_response = MagicMock()
+        listing_response.text = """
+        <a class="comeet-position"
+           href="/career/co/broken-category/33.333/full-stack-engineer/all">
+            <div class="comeet-position-name">Full Stack Engineer</div>
+            <div class="comeet-position-meta">Full-time</div>
+        </a>
+        """
+        detail_response = MagicMock()
+        detail_response.text = """
+        <script type="application/ld+json">
+        {
+          "@type": "JobPosting",
+          "hiringOrganization": {"name": "Example",},
+          "applicantLocationRequirements": {
+            "@type": "Country",
+            "name": "IL"
+          },
+          "jobLocationType": "TELECOMMUTE"
+        }
+        </script>
+        """
+        with patch(
+            "scrapers.browser.custom_adapters.requests.get",
+            side_effect=[listing_response, detail_response],
+        ):
+            result = custom_adapters.scrape_comeet(
+                {
+                    "company_id": "example",
+                    "api_url": "https://example.com/careers/",
+                }
+            )
+
+        self.assertEqual(result.jobs[0]["location"], "IL")
+
+    def test_request_failure_is_failed(self) -> None:
+        """Return a typed failure when the board is unreachable."""
+
+        company = {"company_id": "example", "api_url": "https://www.comeet.com/jobs/example/1"}
+
+        with patch(
+            "scrapers.browser.custom_adapters.requests.get",
+            side_effect=custom_adapters.requests.RequestException("boom"),
+        ):
+            result = custom_adapters.scrape_comeet(company)
+
+        self.assertEqual(result.status, ScrapeStatus.FAILED)
+        self.assertEqual(result.jobs, [])
+
+    def test_blocking_http_statuses_are_waf_blocked(self) -> None:
+        """Classify Comeet 401, 403, and 429 responses as blocked."""
+
+        company = {
+            "company_id": "example",
+            "api_url": "https://www.comeet.com/jobs/example/1",
+        }
+        for status_code in (401, 403, 429):
+            with self.subTest(status_code=status_code):
+                response = MagicMock()
+                response.status_code = status_code
+                error = custom_adapters.requests.HTTPError(
+                    f"HTTP {status_code}",
+                    response=response,
+                )
+                with patch(
+                    "scrapers.browser.custom_adapters.requests.get",
+                    side_effect=error,
+                ):
+                    result = custom_adapters.scrape_comeet(company)
+
+                self.assertEqual(result.status, ScrapeStatus.WAF_BLOCKED)
+                self.assertEqual(result.jobs, [])
+                self.assertIn(str(status_code), result.message)
+
+    def test_empty_positions_are_no_jobs(self) -> None:
+        """Keep a readable empty Comeet board distinct from failures."""
+
+        response = MagicMock()
+        response.text = "window.COMPANY_POSITIONS_DATA = [];"
+        with patch(
+            "scrapers.browser.custom_adapters.requests.get",
+            return_value=response,
+        ):
+            result = custom_adapters.scrape_comeet({
+                "company_id": "example",
+                "api_url": "https://www.comeet.com/jobs/example/1",
+            })
+
+        self.assertEqual(result.status, ScrapeStatus.NO_JOBS)
+        self.assertEqual(result.jobs, [])
+
+    def test_missing_company_id_or_api_url_is_failed(self) -> None:
+        """Return a typed failure when required configuration is absent."""
+
+        with patch("scrapers.browser.custom_adapters.requests.get") as get:
+            missing_id = custom_adapters.scrape_comeet(
+                {"api_url": "https://x.test"}
+            )
+            missing_url = custom_adapters.scrape_comeet(
+                {"company_id": "x"}
+            )
+
+        self.assertEqual(missing_id.status, ScrapeStatus.FAILED)
+        self.assertEqual(missing_id.jobs, [])
+        self.assertEqual(missing_url.status, ScrapeStatus.FAILED)
+        self.assertEqual(missing_url.jobs, [])
+        get.assert_not_called()
+
+
+class WorkableAdapterTests(unittest.TestCase):
+    """Verify the Workable job-board API adapter."""
+
+    def test_posts_empty_body_and_normalizes_results(self) -> None:
+        """POST (not GET -- a plain GET 404s) and normalize real fields.
+
+        Confirmed live: Workable's public listing API only responds to a
+        POST with an empty JSON body.
+        """
+
+        response = MagicMock()
+        response.json.return_value = {
+            "total": 1,
+            "results": [
+                {
+                    "id": 6033288,
+                    "shortcode": "514DE2B215",
+                    "title": "AI Researcher - Video Generation",
+                    "location": {
+                        "city": "Tel Aviv-Yafo",
+                        "region": "Tel Aviv District",
+                        "country": "Israel",
+                    },
+                }
+            ],
+        }
+        company = {
+            "company_id": "d_id",
+            "api_url": "https://apply.workable.com/api/v3/accounts/d-id/jobs",
+        }
+
+        with patch(
+            "scrapers.browser.custom_adapters.requests.post",
+            return_value=response,
+        ) as post:
+            result = custom_adapters.scrape_workable(company)
+
+        self.assertEqual(result.status, ScrapeStatus.SUCCESS)
+        self.assertEqual(post.call_args.args[0], company["api_url"])
+        self.assertEqual(post.call_args.kwargs["json"], {})
+        self.assertEqual(
+            result.jobs,
+            [
+                {
+                    "id": "d_id_514DE2B215",
+                    "title": "AI Researcher - Video Generation",
+                    "location": "Tel Aviv-Yafo | Tel Aviv District | Israel",
+                    "url": "https://apply.workable.com/d-id/j/514DE2B215/",
+                    "content": "",
+                }
+            ],
+        )
+
+    def test_position_without_shortcode_or_title_is_skipped(self) -> None:
+        """Drop entries with no shortcode: it is the only field that builds
+        a working public job URL, so a job without one is not useful
+        downstream even if it otherwise looks valid."""
+
+        response = MagicMock()
+        response.json.return_value = {
+            "results": [
+                {"id": 1, "shortcode": "AAA", "title": "Valid Role"},
+                {"id": 2, "shortcode": "", "title": "No Shortcode"},
+                {"id": 3, "shortcode": "BBB", "title": ""},
+            ]
+        }
+        company = {
+            "company_id": "example",
+            "api_url": "https://apply.workable.com/api/v3/accounts/example/jobs",
+        }
+
+        with patch(
+            "scrapers.browser.custom_adapters.requests.post",
+            return_value=response,
+        ):
+            result = custom_adapters.scrape_workable(company)
+
+        self.assertEqual(result.status, ScrapeStatus.SUCCESS)
+        self.assertEqual(
+            [job["id"] for job in result.jobs],
+            ["example_AAA"],
+        )
+
+    def test_request_failure_returns_failed_result(self) -> None:
+        """Expose a typed failure when the board is unreachable."""
+
+        company = {
+            "company_id": "example",
+            "api_url": "https://apply.workable.com/api/v3/accounts/example/jobs",
+        }
+
+        with patch(
+            "scrapers.browser.custom_adapters.requests.post",
+            side_effect=custom_adapters.requests.RequestException("boom"),
+        ):
+            result = custom_adapters.scrape_workable(company)
+
+        self.assertEqual(result.status, ScrapeStatus.FAILED)
+        self.assertEqual(result.jobs, [])
+        self.assertIn("boom", result.message)
+
+    def test_missing_company_id_or_api_url_returns_failed_result(self) -> None:
+        """Refuse to guess when required configuration is absent."""
+
+        with patch("scrapers.browser.custom_adapters.requests.post") as post:
+            missing_id = custom_adapters.scrape_workable(
+                {"api_url": "https://x.test"}
+            )
+            missing_url = custom_adapters.scrape_workable(
+                {"company_id": "x"}
+            )
+        self.assertEqual(missing_id.status, ScrapeStatus.FAILED)
+        self.assertEqual(missing_url.status, ScrapeStatus.FAILED)
+        self.assertEqual(missing_id.jobs, [])
+        self.assertEqual(missing_url.jobs, [])
+        post.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main()

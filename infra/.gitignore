@@ -1,0 +1,13 @@
+# Local values (subscription ID, home IP) - use terraform.tfvars.example as a template
+terraform.tfvars
+*.auto.tfvars
+
+# Terraform state and plans (can contain sensitive data)
+*.tfstate
+*.tfstate.*
+tfplan
+*.tfplan
+crash.log
+
+# Downloaded providers (recreated by terraform init)
+.terraform/
