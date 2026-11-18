@@ -716,7 +716,16 @@ class JobProducer:
 
         history = self._history_store.load()
         health_state = self._health_store.load()
-        new_health_state = dict(health_state)
+        # Keep health only for active companies, so disabled sites drop out
+        # of the daily failing-sites summary.
+        active_ids = {
+            str(c.get("company_id")) for c in companies if c.get("is_active", True)
+        }
+        new_health_state = {
+            company_id: state
+            for company_id, state in health_state.items()
+            if company_id in active_ids
+        }
         pending_ids = self._queue.ids()
         new_jobs: list[dict[str, Any]] = []
         queued_job_ids: set[str] = set()

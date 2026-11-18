@@ -1121,7 +1121,7 @@ class CompanyConfigurationTests(unittest.TestCase):
                 "https://www.comeet.com/jobs/zeronetworks/39.00F"
             ),
             "superplay": "https://www.comeet.com/jobs/superplay/28.003",
-            "fetcherr": "https://www.fetcherr.io/careers",
+            "fetcherr": "https://www.fetcherr.io/career",
             "navina": "https://www.navina.ai/careers",
             "nym_health": "https://nym.health/careers/",
             "windward": "https://windward.ai/careers/",
@@ -1266,10 +1266,6 @@ class CompanyConfigurationTests(unittest.TestCase):
         """Pin the first eight production-verified Greenhouse routes."""
 
         self._assert_step8_routes("greenhouse", {
-            "innovid": (
-                "https://boards-api.greenhouse.io/v1/boards/innovid/"
-                "jobs?content=true"
-            ),
             "beamup": (
                 "https://boards-api.greenhouse.io/v1/boards/beamup/"
                 "jobs?content=true"
@@ -1380,7 +1376,6 @@ class CompanyConfigurationTests(unittest.TestCase):
 
         self._assert_step8_routes("ashby", {
             "ledge": "https://api.ashbyhq.com/posting-api/job-board/ledge",
-            "tavily": "https://api.ashbyhq.com/posting-api/job-board/tavily",
             "pointfive": (
                 "https://api.ashbyhq.com/posting-api/job-board/pointfive"
             ),

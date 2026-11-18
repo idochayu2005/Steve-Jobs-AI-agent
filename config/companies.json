@@ -106,7 +106,7 @@
     "company_id": "sap",
     "company_name": "SAP Israel",
     "tier": "A",
-    "is_active": true,
+    "is_active": false,
     "ats_type": "successfactors",
     "api_url": "https://jobs.sap.com/go/Israel/8807501/",
     "location_filters": [
@@ -116,7 +116,7 @@
       "Tel Aviv"
     ],
     "target_keywords": [],
-    "notes": "SAP SuccessFactors career portal. Parse the official Israel result pages and pagination."
+    "notes": "DISABLED 2026-11-18: careers site blocks automated access (403). SAP SuccessFactors career portal. Parse the official Israel result pages and pagination."
   },
   {
     "company_id": "mobileye",
@@ -901,7 +901,7 @@
     "company_id": "fiverr",
     "company_name": "Fiverr",
     "tier": "C",
-    "is_active": true,
+    "is_active": false,
     "ats_type": "custom",
     "fetch_strategy": "browser",
     "api_url": "https://www.fiverr.com/jobs/offices/tlv?location=tel-aviv-yafo",
@@ -912,7 +912,7 @@
       "Tel Aviv-Yafo"
     ],
     "target_keywords": [],
-    "notes": "Official Fiverr careers listing. Jobs are rendered inside Fiverr's custom careers experience; crawl team and Tel Aviv office pages."
+    "notes": "DISABLED 2026-11-18: careers page moved (404); old custom adapter no longer matches. Official Fiverr careers listing. Jobs are rendered inside Fiverr's custom careers experience; crawl team and Tel Aviv office pages."
   },
   {
     "company_id": "riskified",
@@ -1362,13 +1362,13 @@
   {
     "company_id": "cybereason",
     "company_name": "Cybereason",
-    "is_active": true,
+    "is_active": false,
     "ats_type": "greenhouse",
     "api_url": "https://boards-api.greenhouse.io/v1/boards/cybereason/jobs?content=true",
     "location_filters": [
       "Israel"
     ],
-    "notes": "Greenhouse public boards-api endpoint; token verified live via direct request."
+    "notes": "DISABLED 2026-11-18: Greenhouse board removed (404). Greenhouse public boards-api endpoint; token verified live via direct request."
   },
   {
     "company_id": "cycode",
@@ -1728,13 +1728,13 @@
   {
     "company_id": "nxp_semiconductors",
     "company_name": "NXP Semiconductors",
-    "is_active": true,
+    "is_active": false,
     "ats_type": "workday",
     "api_url": "https://nxp.wd3.myworkdayjobs.com/wday/cxs/nxp/careers/jobs",
     "location_filters": [
       "Israel"
     ],
-    "notes": "Workday CXS endpoint derived from the tenant/site in the company's own careers URL; verified live via direct request."
+    "notes": "DISABLED 2026-11-18: Workday API rejects requests (HTTP 422). Workday CXS endpoint derived from the tenant/site in the company's own careers URL; verified live via direct request."
   },
   {
     "company_id": "orbit_communication_systems",
@@ -2903,13 +2903,13 @@
   {
     "company_id": "sapiens",
     "company_name": "Sapiens",
-    "is_active": true,
+    "is_active": false,
     "ats_type": "successfactors",
     "api_url": "https://careers.sapiens.com/search/?q=&locationsearch=Israel",
     "location_filters": [
       "Israel"
     ],
-    "notes": "SuccessFactors search page found by Codex; independently re-verified live via scrape_successfactors (2 jobs in Holon)."
+    "notes": "DISABLED 2026-11-18: careers site blocks automated access (403). SuccessFactors search page found by Codex; independently re-verified live via scrape_successfactors (2 jobs in Holon)."
   },
   {
     "company_id": "matrix_it",
@@ -3563,7 +3563,7 @@
     "company_name": "Fetcherr",
     "is_active": true,
     "ats_type": "comeet",
-    "api_url": "https://www.fetcherr.io/careers",
+    "api_url": "https://www.fetcherr.io/career",
     "location_filters": [
       "Israel"
     ],
@@ -3873,14 +3873,14 @@
   {
     "company_id": "innovid",
     "company_name": "Innovid",
-    "is_active": true,
+    "is_active": false,
     "ats_type": "greenhouse",
     "api_url": "https://boards-api.greenhouse.io/v1/boards/innovid/jobs?content=true",
     "location_filters": [
       "Israel"
     ],
     "fetch_strategy": "api",
-    "notes": "Greenhouse public boards API; token and live Israel jobs verified through the production adapter during step 8 batch 2."
+    "notes": "DISABLED 2026-11-18: Greenhouse board removed (404). Greenhouse public boards API; token and live Israel jobs verified through the production adapter during step 8 batch 2."
   },
   {
     "company_id": "beamup",
@@ -4243,12 +4243,12 @@
   {
     "company_id": "tavily",
     "company_name": "Tavily",
-    "is_active": true,
+    "is_active": false,
     "ats_type": "ashby",
     "api_url": "https://api.ashbyhq.com/posting-api/job-board/tavily",
     "location_filters": ["Israel"],
     "fetch_strategy": "api",
-    "notes": "Canonical Ashby board linked by the official careers page; live Israel jobs and target-role relevance verified during step 8 batch 3."
+    "notes": "DISABLED 2026-11-18: Ashby board removed (404); new careers page has no public job feed. Canonical Ashby board linked by the official careers page; live Israel jobs and target-role relevance verified during step 8 batch 3."
   },
   {
     "company_id": "pointfive",

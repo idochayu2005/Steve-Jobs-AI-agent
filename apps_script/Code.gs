@@ -168,8 +168,11 @@ function readSent_(days) {
   var query = 'in:sent newer_than:' + safeDays_(days) + 'd ' +
       '(filename:pdf OR "קורות חיים" OR "קורות החיים" OR "מועמדות" OR cv OR resume ' +
       'OR "apply" OR "applying" OR "application" OR "position")';
-  var own = [Session.getActiveUser().getEmail()].concat(GmailApp.getAliases())
-      .map(function (a) { return String(a).toLowerCase(); });
+  // Script property OWN_EMAILS (comma-separated) lists Ido's other addresses.
+  var extra = (PropertiesService.getScriptProperties().getProperty('OWN_EMAILS') || '').split(',');
+  var own = [Session.getActiveUser().getEmail()].concat(GmailApp.getAliases(), extra)
+      .map(function (a) { return String(a).trim().toLowerCase(); })
+      .filter(function (a) { return a; });
   var out = [];
   GmailApp.search(query, 0, 50).forEach(function (thread) {
     thread.getMessages().forEach(function (m) {
