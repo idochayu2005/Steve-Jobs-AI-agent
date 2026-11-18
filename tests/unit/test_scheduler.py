@@ -181,6 +181,23 @@ class AutonomousSchedulerTests(unittest.TestCase):
         self.assertEqual(len(self._launched_modules()), 2)
         self.assertEqual(recorded, _at(12, 0).isoformat())
 
+    def test_no_slots_on_friday_and_saturday(self) -> None:
+        """Pause on Friday and Saturday; run again on Sunday (Israel time)."""
+
+        self.assertIsNone(self.scheduler._due_run_marker(_at(10, 0, day=18)))
+        self.assertIsNone(self.scheduler._due_run_marker(_at(15, 0, day=19)))
+        self.assertIsNotNone(self.scheduler._due_run_marker(_at(10, 0, day=20)))
+
+    def test_startup_run_skipped_on_saturday(self) -> None:
+        """Do not run on startup during the weekend pause."""
+
+        self.now_provider.return_value = _at(12, 0, day=19)
+
+        with self.assertRaises(KeyboardInterrupt):
+            self.scheduler.serve_forever()
+
+        self.assertEqual(self._launched_modules(), [])
+
     def test_serve_forever_runs_immediately_when_no_slot_is_due(self) -> None:
         """Prove liveness on startup even between scheduled slots."""
 

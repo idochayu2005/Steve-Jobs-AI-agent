@@ -20,7 +20,7 @@ resource "azurerm_logic_app_workflow" "vm_autostart" {
   }
 }
 
-# Every 15 minutes, 09:00-19:45 Israel time: covers the agent's 10:00, 16:00
+# Every 15 minutes, 09:00-19:45 Israel time, Sunday-Thursday: covers the agent's 10:00, 16:00
 # and 19:00 runs and leaves the VM alone at night (the course
 # subscription shuts VMs down at 20:00, see the "scheduling" tag).
 # A Logic App has one trigger, and its schedule is "these hours x these
@@ -29,11 +29,13 @@ resource "azurerm_logic_app_trigger_recurrence" "every_15_minutes" {
   count        = var.use_spot ? 1 : 0
   name         = "every-15-minutes-daytime"
   logic_app_id = azurerm_logic_app_workflow.vm_autostart[0].id
-  frequency    = "Day"
+  frequency    = "Week"
   interval     = 1
   time_zone    = "Israel Standard Time"
 
+  # Sunday-Thursday only: the agent pauses on Friday and Saturday.
   schedule {
+    on_these_days    = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday"]
     at_these_hours   = [9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
     at_these_minutes = [0, 15, 30, 45]
   }

@@ -1741,7 +1741,7 @@
     "company_name": "Orbit Communication Systems",
     "is_active": true,
     "ats_type": "comeet",
-    "api_url": "https://www.orbit-cs.com/careers",
+    "api_url": "https://www.comeet.com/jobs/orbit_communication_systems/2B.008",
     "location_filters": [
       "Israel"
     ],
@@ -4283,12 +4283,12 @@
   {
     "company_id": "vivid",
     "company_name": "Vivid",
-    "is_active": true,
+    "is_active": false,
     "ats_type": "ashby",
     "api_url": "https://api.ashbyhq.com/posting-api/job-board/vivid",
     "location_filters": ["Israel"],
     "fetch_strategy": "api",
-    "notes": "Ashby public job-board API; live Israel jobs and target-role relevance verified during step 8 batch 3."
+    "notes": "DISABLED 2026-11-18: Ashby board returns 404 (board removed). Ashby public job-board API; live Israel jobs and target-role relevance verified during step 8 batch 3."
   },
   {
     "company_id": "sweep",

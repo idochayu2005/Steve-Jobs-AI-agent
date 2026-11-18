@@ -36,6 +36,8 @@ class AutonomousScheduler:
     # requiring an exact-second match, which polling every 60s cannot
     # guarantee.
     CATCH_UP_WINDOW_SECONDS = 5 * 60
+    # No runs on Friday (4) and Saturday (5), Israel time.
+    PAUSED_WEEKDAYS = frozenset({4, 5})
     STARTUP_SKIP_WINDOW = timedelta(hours=2)
     POLL_INTERVAL_SECONDS = 60.0
     # Each phase runs as an isolated, killable subprocess. A hung Playwright
@@ -151,6 +153,11 @@ class AutonomousScheduler:
 
         return result.returncode
 
+    def _is_paused_day(self, now: datetime) -> bool:
+        """Return True on Friday and Saturday in Israel time."""
+
+        return now.astimezone(self.TIMEZONE).weekday() in self.PAUSED_WEEKDAYS
+
     def _due_run_marker(self, now: datetime) -> str | None:
         """Return a unique marker for the run slot currently due, if any.
 
@@ -160,6 +167,8 @@ class AutonomousScheduler:
         skipped until the next slot rather than firing hours late.
         """
 
+        if self._is_paused_day(now):
+            return None
         for target in self.RUN_TIMES:
             target_today = now.replace(
                 hour=target.hour,
@@ -202,11 +211,13 @@ class AutonomousScheduler:
         """Run immediately, then at each fixed Israel-time slot, forever."""
 
         LOGGER.info(
-            "Scheduler started; job searches will run daily at %s Israel "
-            "time.",
+            "Scheduler started; job searches will run Sunday-Thursday at %s "
+            "Israel time.",
             ", ".join(t.strftime("%H:%M") for t in self.RUN_TIMES),
         )
-        if self._ran_recently():
+        if self._is_paused_day(self.now_provider()):
+            LOGGER.info("Friday/Saturday pause; skipping the startup run.")
+        elif self._ran_recently():
             LOGGER.info("A cycle ran recently; skipping the startup run.")
         else:
             self.run_cycle()

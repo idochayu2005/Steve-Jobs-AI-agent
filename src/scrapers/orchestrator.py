@@ -455,10 +455,27 @@ class OperationalReporter:
     logged and ignored, so candidate-job processing is never affected.
     """
 
-    def __init__(self, notifier: OperationalMessageSender | None) -> None:
-        """Wrap an optional transport (``None`` disables all messages)."""
+    FAILURE_REPORT_THRESHOLD = 3
+
+    def __init__(
+        self,
+        notifier: OperationalMessageSender | None,
+        digest_file: Any = None,
+        today: Callable[[], str] | None = None,
+    ) -> None:
+        """Wrap an optional transport (``None`` disables all messages).
+
+        ``digest_file`` remembers the day the last health digest was sent
+        (None: no once-a-day limit). ``today`` returns the Israel date.
+        """
 
         self._notifier = notifier
+        self._digest_file = digest_file
+        self._today = today or (
+            lambda: __import__("datetime").datetime.now(
+                __import__("zoneinfo").ZoneInfo("Asia/Jerusalem")
+            ).date().isoformat()
+        )
 
     def send_heartbeat(self) -> None:
         """Notify operators that the cycle succeeded with zero new jobs."""
@@ -470,11 +487,30 @@ class OperationalReporter:
         previous_state: Mapping[str, Mapping[str, Any]],
         current_state: Mapping[str, Mapping[str, Any]],
     ) -> None:
-        """Send one digest when scraper-health anomaly state changed."""
+        """Send at most one daily summary of sites failing 3+ scans in a row.
+
+        Single status flips are no longer reported: a site is listed only
+        after ``FAILURE_REPORT_THRESHOLD`` consecutive failed scans, and the
+        whole list goes out in one message no more than once per Israel day.
+        """
 
         message = self.build_health_digest(previous_state, current_state)
-        if message is not None:
-            self._send(message, "Scraper-health digest")
+        if message is None:
+            return
+        today = self._today()
+        if self._digest_file is not None:
+            try:
+                if self._digest_file.read_text(encoding="utf-8").strip() == today:
+                    return
+            except OSError:
+                pass
+        self._send(message, "Scraper-health digest")
+        if self._digest_file is not None:
+            try:
+                self._digest_file.parent.mkdir(parents=True, exist_ok=True)
+                self._digest_file.write_text(today, encoding="utf-8")
+            except OSError:
+                LOGGER.warning("Could not record the health digest date.")
 
     def _send(self, message: str, message_kind: str) -> None:
         """Deliver one message, logging rather than raising on failure."""
@@ -493,71 +529,34 @@ class OperationalReporter:
         if not getattr(result, "success", True):
             LOGGER.warning("%s delivery did not succeed.", message_kind)
 
-    @staticmethod
+    @classmethod
     def build_health_digest(
+        cls,
         previous_state: Mapping[str, Mapping[str, Any]],
         current_state: Mapping[str, Mapping[str, Any]],
     ) -> str | None:
-        """Build one digest for meaningful scraper-health transitions."""
+        """List sites whose last ``FAILURE_REPORT_THRESHOLD``+ scans failed."""
 
-        lines: list[str] = []
-        for company_id, current in current_state.items():
-            previous = previous_state.get(company_id)
-            if previous is None:
-                continue
-
-            old_status = str(previous.get("last_status", ""))
-            new_status = str(current.get("last_status", ""))
-            company_name = str(current.get("company_name") or company_id)
-            if old_status == new_status:
-                # A company that has never once succeeded stays "unverified"
-                # forever regardless of current errors (see
-                # CompanyHealthTracker), so it can never cross an
-                # ANOMALY_HEALTH_STATUSES transition. Watch last_error_type
-                # directly so a newly-blocked (or newly-recovered)
-                # never-verified company still surfaces here.
-                old_error = previous.get("last_error_type")
-                new_error = current.get("last_error_type")
-                if old_error == new_error:
-                    continue
-                if new_error:
-                    lines.append(
-                        f"🚨 {company_name}: error appeared ({new_error}), "
-                        f"status={new_status}"
-                    )
-                else:
-                    lines.append(
-                        f"✅ {company_name}: error cleared "
-                        f"({old_error} -> none), status={new_status}"
-                    )
-                continue
-            if new_status in ANOMALY_HEALTH_STATUSES:
-                details = [f"{old_status} -> {new_status}"]
-                error_type = current.get("last_error_type")
-                if error_type:
-                    details.append(f"error={error_type}")
-                if new_status == "failed":
-                    details.append(
-                        "consecutive failures="
-                        f"{current.get('consecutive_failures', 0)}"
-                    )
-                else:
-                    details.append(
-                        "consecutive zero-job runs="
-                        f"{current.get('consecutive_zero_job_runs', 0)}"
-                    )
-                lines.append(f"🚨 {company_name}: " + " | ".join(details))
-            elif (
-                old_status in ANOMALY_HEALTH_STATUSES
-                and new_status == "healthy"
-            ):
-                lines.append(
-                    f"✅ {company_name}: recovered ({old_status} -> healthy)"
-                )
-
-        if not lines:
+        failing = sorted(
+            (
+                int(current.get("consecutive_failures", 0) or 0),
+                str(current.get("company_name") or company_id),
+                str(current.get("last_error_type") or "error"),
+            )
+            for company_id, current in current_state.items()
+            if int(current.get("consecutive_failures", 0) or 0)
+            >= cls.FAILURE_REPORT_THRESHOLD
+        )
+        if not failing:
             return None
-        return "Scraper health changes:\n" + "\n".join(lines)
+        lines = [
+            f"• {name}: {count} failed scans in a row ({error})"
+            for count, name, error in sorted(failing, reverse=True)
+        ]
+        return (
+            f"🛠 Daily scraper check: {len(failing)} site(s) failing "
+            f"{cls.FAILURE_REPORT_THRESHOLD}+ scans in a row:\n" + "\n".join(lines)
+        )
 
 
 class TelegramAlertFormatter:
@@ -978,7 +977,9 @@ def run_scraper(
         location_filter=location_filter or LocationFilter(strict_mode=False),
         history_store=history_store or JobHistoryStore(HISTORY_FILE),
         health_store=health_store or ScraperHealthStore(HEALTH_FILE),
-        reporter=OperationalReporter(heartbeat_notifier),
+        reporter=OperationalReporter(
+            heartbeat_notifier, digest_file=DATA_DIR / "health_digest_sent.txt"
+        ),
         sheet_rows=sheet_rows,
     ).run()
 

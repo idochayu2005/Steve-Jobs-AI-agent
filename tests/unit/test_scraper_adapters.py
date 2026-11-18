@@ -1388,7 +1388,6 @@ class CompanyConfigurationTests(unittest.TestCase):
                 "https://api.ashbyhq.com/posting-api/job-board/enclave"
             ),
             "glow": "https://api.ashbyhq.com/posting-api/job-board/glow",
-            "vivid": "https://api.ashbyhq.com/posting-api/job-board/vivid",
             "sweep": "https://api.ashbyhq.com/posting-api/job-board/sweep",
             "pi_security": (
                 "https://api.ashbyhq.com/posting-api/job-board/pi-security"

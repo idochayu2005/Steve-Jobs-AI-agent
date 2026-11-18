@@ -17,6 +17,10 @@
  *                      Moves processed alert emails to Trash (recoverable
  *                      for 30 days). Only messages labelled "Job Alerts"
  *                      are touched; anything else is skipped.
+ *   "sent"             {days} -> {ok, messages:[{id,threadId,date,to,subject,
+ *                      body,pdf}]} applications Ido sent (CV attached or
+ *                      apply/CV wording); mail only to his own addresses is
+ *                      left out (read only).
  *   "rows"             -> {ok, rows:[{row, company, title, status, link}]}
  *   "set_status"       {updates:[{row, status, expect, note}]}
  *                      -> {ok, updated, skipped}
@@ -50,6 +54,7 @@ function doPost(e) {
     if (action === 'alerts') return reply_(readAlerts_(body.days));
     if (action === 'replies') return reply_(readReplies_(body.days));
     if (action === 'trash') return reply_(trashAlerts_(body.ids || []));
+    if (action === 'sent') return reply_(readSent_(body.days));
 
     lock.waitLock(30000);
     var sheet = SpreadsheetApp.getActive().getSheetByName(TAB_NAME);
@@ -131,10 +136,13 @@ function readAlerts_(days) {
 function readReplies_(days) {
   var query = 'newer_than:' + safeDays_(days) + 'd -label:"' + ALERT_LABEL + '" ' +
       '-from:jobalerts-noreply@linkedin.com -from:jobs-listings@linkedin.com ' +
-      '("thank you for applying" OR "thanks for applying" OR "application was sent" ' +
-      'OR "received your application" OR "your application" OR "move forward" ' +
+      '-from:me ("thank you for applying" OR "thanks for applying" OR "application was sent" ' +
+      'OR "received your application" OR "your application" OR "application received" ' +
+      'OR "thank you for your application" OR "thanks for your application" ' +
+      'OR "move forward" ' +
       'OR "moving forward" OR "other candidates" OR "not to proceed" ' +
-      'OR "unfortunately" OR "interview" OR "קורות החיים" OR "מועמדותך" OR "מועמדות")';
+      'OR "unfortunately" OR "interview" OR "קורות החיים" OR "מועמדותך" OR "מועמדות" ' +
+      'OR "תודה על פנייתך" OR "קיבלנו את")';
   return {ok: true, messages: readMessages_(query, 50)};
 }
 
@@ -154,6 +162,36 @@ function trashAlerts_(ids) {
     }
   });
   return {ok: true, trashed: trashed, skipped: skipped};
+}
+
+function readSent_(days) {
+  var query = 'in:sent newer_than:' + safeDays_(days) + 'd ' +
+      '(filename:pdf OR "קורות חיים" OR "קורות החיים" OR "מועמדות" OR cv OR resume ' +
+      'OR "apply" OR "applying" OR "application" OR "position")';
+  var own = [Session.getActiveUser().getEmail()].concat(GmailApp.getAliases())
+      .map(function (a) { return String(a).toLowerCase(); });
+  var out = [];
+  GmailApp.search(query, 0, 50).forEach(function (thread) {
+    thread.getMessages().forEach(function (m) {
+      var from = String(m.getFrom()).toLowerCase();
+      var isMine = own.some(function (a) { return a && from.indexOf(a) >= 0; });
+      if (!isMine) return;
+      var to = [m.getTo(), m.getCc()].join(',').split(',')
+          .map(function (x) { return x.trim(); })
+          .filter(function (x) {
+            var lower = x.toLowerCase();
+            return x && !own.some(function (a) { return a && lower.indexOf(a) >= 0; });
+          });
+      if (!to.length) return;  // only to Ido's own addresses
+      var pdf = m.getAttachments().some(function (a) {
+        return /\.pdf$/i.test(a.getName());
+      });
+      out.push({id: m.getId(), threadId: thread.getId(), date: m.getDate().toISOString(),
+                to: to.join(', '), subject: m.getSubject(), pdf: pdf,
+                body: String(m.getPlainBody()).slice(0, 4000)});
+    });
+  });
+  return {ok: true, messages: out};
 }
 
 function readMessages_(query, maxThreads) {

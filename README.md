@@ -15,7 +15,9 @@
 > - **Central-Israel location filter** and infra-focused title filters.
 > - **Azure hosting with Terraform** (`infra/`): a Spot VM with an auto-restart
 >   Logic App that starts it again after evictions.
-> - Schedule: 10:00, 15:00 and 19:00 Israel time, without an extra run on redeploys.
+> - Sent-mail check: applications Ido sends by email (CV attached) are marked Applied or added to the sheet.
+> - Schedule: 10:00, 15:00 and 19:00 Israel time, Sunday-Thursday (paused Friday/Saturday), without an extra run on redeploys.
+> - Scraper health: one daily Telegram summary of sites that failed 3+ scans in a row.
 
 An autonomous job-hunting agent that scans **363 Israeli tech employers** three
 times a day and sends only relevant **junior and student** openings to Telegram,

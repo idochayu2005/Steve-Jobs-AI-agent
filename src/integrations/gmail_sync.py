@@ -252,7 +252,7 @@ Return JSON only:
 {{"kind": "applied" | "rejected" | "interview" | "other",
   "company": "<hiring company name or "">",
   "job_title": "<job title or "">"}}
-- "applied": confirms an application was received/sent (e.g. "thanks for applying", "your application was sent to X").
+- "applied": confirms an application was received/sent, e.g. LinkedIn "your application was sent to X", or an automatic confirmation from a company or its hiring system (Comeet, Rippling, Workday, HiBob, Greenhouse, Lever, Ashby, SmartRecruiters, dueto, etc.): "thank you for applying", "application received", "we received your application", "תודה על פנייתך", "קורות החיים התקבלו". For these, company is the hiring company, not the hiring system.
 - "rejected": the company will not proceed with the candidate (e.g. "decided to move forward with other candidates", "not to proceed"). If the email says the role/program is not relevant for the candidate or the candidate declined, use "other".
 - "interview": invites to an interview/call or a home assignment.
 - "other": anything else (newsletters, job alerts, marketing, recruiters' generic offers).
@@ -264,15 +264,77 @@ Body:
 {body}"""
 
 TRANSITIONS: dict[str, tuple[str, tuple[str, ...]]] = {
-    # kind: (new status, statuses it may replace)
-    "applied": ("Applied", ("", "New")),
-    "interview": ("Interview", ("", "New", "Applied")),
-    "rejected": ("Rejected", ("", "New", "Applied", "Interview")),
+    # kind: (new status, statuses it must NOT replace). Any other status
+    # (New, Not applied, Not interested, empty, ...) is updated, so an
+    # application-sent email always wins over a "didn't apply" mark.
+    "applied": ("Applied", ("Applied", "Interview", "Offer", "Rejected")),
+    "interview": ("Interview", ("Interview", "Offer", "Rejected")),
+    "rejected": ("Rejected", ("Rejected", "Offer")),
 }
 
 # Kinds of email that add a new sheet row when the company isn't listed yet.
 NEW_ROW_STATUS = {"applied": "Applied", "interview": "Interview"}
 LINKEDIN_VIEW_RE = re.compile(r"linkedin\.com/(?:comm/)?jobs/view/(\d+)", re.I)
+
+SENT_DAYS = 30
+SENT_PROMPT = """You read an email the job seeker SENT. Decide if it is a job
+application or CV sent to an employer or recruiter. Return JSON only:
+{{"is_application": true | false,
+  "company": "<hiring company or recruiting agency name, or "">",
+  "job_title": "<job title applied for, or "">"}}
+Not an application: personal mail, replies about other topics, forwarding
+a job to a friend, mail to himself.
+
+To: {to}
+Subject: {subject}
+Has PDF attachment: {pdf}
+Body:
+{body}"""
+FREE_MAIL_DOMAINS = {
+    "gmail.com", "googlemail.com", "yahoo.com", "outlook.com", "hotmail.com",
+    "live.com", "icloud.com", "walla.co.il", "walla.com", "012.net.il",
+    "bezeqint.net", "netvision.net.il", "msn.com", "aol.com", "proton.me",
+    "protonmail.com",
+}
+EMAIL_RE = re.compile(r"[\w.+-]+@([\w-]+(?:\.[\w-]+)+)")
+
+
+def company_from_domain(recipients: str) -> str:
+    """Guess a company name from the first non-free-mail recipient domain."""
+
+    for domain in EMAIL_RE.findall(recipients or ""):
+        domain = domain.lower()
+        if domain in FREE_MAIL_DOMAINS:
+            continue
+        parts = domain.split(".")
+        # orbit-cs.com -> orbit-cs ; jobs.pentera.io -> pentera ; x.co.il -> x
+        core = parts[-3] if len(parts) >= 3 and parts[-2] in {"co", "org", "net", "ac", "gov"} else parts[-2]
+        if core in {"mail", "jobs", "careers", "hr"} and len(parts) >= 3:
+            core = parts[-3]
+        return core.replace("-", " ").strip().title()
+    return ""
+
+
+def sent_application_row(
+    classification: Mapping[str, str],
+    message: Mapping[str, Any],
+) -> list[str]:
+    """Build a sheet row for an application found only in Sent mail."""
+
+    row = new_application_row(classification, message)
+    date_text = str(message.get("date", ""))[:10]
+    thread = str(message.get("threadId") or message.get("id", ""))
+    row[1] = str(classification.get("job_title", "")).strip() or str(
+        message.get("subject", "")).strip()[:80] or "(role not stated)"
+    if row[1] and not row[2]:
+        from integrations.sheets_sync import classify_type
+
+        row[2] = classify_type(row[1])
+    row[9] = f"https://mail.google.com/mail/u/0/#all/{thread}"
+    row[11] = "Applied"
+    row[12] = f"Auto: found in Sent mail {date_text}"
+    row[15] = "Email"
+    return row
 
 
 def new_application_row(
@@ -380,11 +442,11 @@ def plan_status_update(
             return None, "several rows for this company; could not tell which job"
         candidates = scored[:1]
     row = candidates[0]
-    new_status, allowed_from = TRANSITIONS[kind]
+    new_status, keep_statuses = TRANSITIONS[kind]
     current = str(row.get("status", ""))
-    if current == new_status:
+    if current.strip().casefold() == new_status.casefold():
         return None, f"already {new_status}"
-    if current not in allowed_from:
+    if current.strip().casefold() in {k.casefold() for k in keep_statuses}:
         return None, f"status is {current!r}; not changing it to {new_status}"
     return (
         StatusUpdate(
@@ -463,6 +525,40 @@ class GmailSync:
         self._ledger.save(ledger)
         return trashed
 
+    def _read_sent(self, done: set[str]) -> list[dict[str, Any]]:
+        """Return new Sent-mail messages that may be applications.
+
+        An older webhook without the "sent" action is tolerated (logged once
+        per run), so the rest of the Gmail step keeps working.
+        """
+
+        try:
+            messages = self._client.call("sent", days=SENT_DAYS)["messages"]
+        except Exception as error:  # noqa: BLE001 - optional step
+            LOGGER.warning("Sent-mail check skipped: %s", type(error).__name__)
+            return []
+        return [m for m in messages if m["id"] not in done]
+
+    def _classify_sent(self, message: Mapping[str, Any]) -> dict[str, str] | None:
+        """Turn a sent application into an "applied" classification, else None."""
+
+        try:
+            data = json.loads(self._complete(SENT_PROMPT.format(
+                to=message.get("to", ""),
+                subject=message.get("subject", ""),
+                pdf="yes" if message.get("pdf") else "no",
+                body=str(message.get("body", ""))[:3000],
+            )))
+        except Exception as error:  # noqa: BLE001 - skip this message
+            LOGGER.warning("Sent-mail classification failed: %s", type(error).__name__)
+            return None
+        if not data.get("is_application"):
+            return None
+        company = str(data.get("company", "")).strip()
+        company = company or company_from_domain(str(message.get("to", ""))) or "Unknown"
+        return {"kind": "applied", "company": company,
+                "job_title": str(data.get("job_title", "")).strip()}
+
     def run(self, alert_days: int = ALERT_DAYS, reply_days: int = REPLY_DAYS) -> dict[str, Any]:
         """Process new alert emails and replies; return a summary."""
 
@@ -491,15 +587,24 @@ class GmailSync:
 
         replies = [m for m in self._client.call("replies", days=reply_days)["messages"]
                    if m["id"] not in done]
-        if replies:
+        items = [(m, self._classify(m), "reply") for m in replies]
+        sent = self._read_sent(done)
+        for message in sent:
+            classification = self._classify_sent(message)
+            if classification is not None:
+                items.append((message, classification, "sent"))
+        if items:
             rows = self._client.call("rows")["rows"]
             updates: list[StatusUpdate] = []
             new_rows: list[list[str]] = []
-            for message in replies:
-                classification = self._classify(message)
-                update, reason = plan_status_update(
-                    classification, rows, str(message.get("date", ""))[:10]
-                )
+            for message, classification, origin in items:
+                if classification.get("company") == "Unknown":
+                    # Never match an "Unknown" company to an existing row.
+                    update, reason = None, "company not in the sheet"
+                else:
+                    update, reason = plan_status_update(
+                        classification, rows, str(message.get("date", ""))[:10]
+                    )
                 if update:
                     updates.append(update)
                     # Reflect it locally so a second email sees the new status.
@@ -512,10 +617,14 @@ class GmailSync:
                 ):
                     from integrations.sheets_sync import find_duplicate
 
-                    row = new_application_row(classification, message)
-                    existing = find_duplicate(
-                        row[0], row[1], row[9], rows, unknown_title_matches=True
-                    )
+                    row = (sent_application_row if origin == "sent"
+                           else new_application_row)(classification, message)
+                    if row[0] == "Unknown":
+                        existing = find_duplicate("", "", row[9], rows)
+                    else:
+                        existing = find_duplicate(
+                            row[0], row[1], row[9], rows, unknown_title_matches=True
+                        )
                     if existing and existing.get("row") == -1:
                         continue  # a second email about a row added this run
                     if existing:
@@ -531,7 +640,7 @@ class GmailSync:
                     new_rows.append(row)
                     # Reflect it locally so a second email (e.g. LinkedIn
                     # plus the company's own confirmation) doesn't add twice.
-                    rows.append({"row": -1, "company": row[0],
+                    rows.append({"row": -1, "company": row[0], "link": row[9],
                                  "title": row[1], "status": row[11]})
                 elif classification.get("kind") in TRANSITIONS and not (
                     reason.startswith("already") or reason.startswith("status is")
@@ -556,6 +665,7 @@ class GmailSync:
                 self._client.call("append", rows=new_rows)
             summary["added_rows"] = [f"{r[0]} - {r[1]} ({r[11]})" for r in new_rows]
             self._processed.add_many(m["id"] for m in replies)
+            self._processed.add_many(m["id"] for m in sent)
 
         summary["trashed"] = self._trash_finished_alerts(email_jobs)
 
