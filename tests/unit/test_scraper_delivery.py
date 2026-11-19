@@ -161,7 +161,7 @@ class ScraperProducerTests(unittest.TestCase):
         """Keep seniority exclusions stronger than new security role terms."""
 
         titles = (
-            "Senior Security Engineer",
+            "Staff Security Engineer",
             "Lead Security Researcher",
             "Principal SOC Analyst",
             "Security Engineering Manager",
@@ -197,12 +197,13 @@ class ScraperProducerTests(unittest.TestCase):
                 )
                 self.assertEqual(decision.matched_keyword, "engineer i")
 
+        # "Senior" is allowed since 2026-11-19; "Staff" still outranks it.
         senior_decision = scraper.is_relevant_job(
-            "Senior Engineer I - Software Development"
+            "Staff Engineer I - Software Development"
         )
         self.assertFalse(senior_decision.allowed)
         self.assertEqual(senior_decision.reason, "excluded title keyword")
-        self.assertEqual(senior_decision.matched_keyword, "senior")
+        self.assertEqual(senior_decision.matched_keyword, "staff")
 
     def test_graduate_keyword_has_negative_controls(self) -> None:
         """Avoid substring, seniority, and unrelated-program matches."""
@@ -260,7 +261,7 @@ class ScraperProducerTests(unittest.TestCase):
             ("Engineering Manager", "manager"),
             ("Product Manager", "manager"),
             # Seniority sits outside the role phrase.
-            ("Senior Product Manager", "senior"),
+            ("Staff Product Manager", "staff"),
             # A second, unrelated exclusion must still block the title.
             ("Product Manager Intern, Sales", "sales"),
         )

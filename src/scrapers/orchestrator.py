@@ -89,7 +89,7 @@ class OperationalMessageSender(Protocol):
 
 # Blacklist: reject these titles even when they contain student keywords.
 EXCLUDE_KEYWORDS = [
-    "senior", "staff", "lead", "manager", "director", "principal",
+    "staff", "lead", "manager", "director", "principal",
     "head", "vp", "expert", "architect", "sales", "marketing",
     "human resources", "hr", "business development", "recruiter",
     "recruiting", "talent acquisition", "customer success",
@@ -127,6 +127,10 @@ TARGET_ROLE_KEYWORDS = [
     "cloud security", "security administrator", "identity and access", "iam",
     "system administrator", "systems administrator", "sysadmin",
     "it engineer", "it administrator", "it systems",
+    # Hands-on "manager" titles common in small companies (ido, 2026-11-19).
+    "it manager", "it infrastructure manager", "it & infrastructure manager",
+    "it and infrastructure manager", "infrastructure manager",
+    "system manager", "systems manager",
     "system engineer", "systems engineer",
     "cloud operations", "cloud support", "infrastructure",
     "monitoring", "cloud monitoring"
@@ -150,7 +154,7 @@ STUDENT_EXCLUDE_KEYWORDS = [
 # Noise seen in the first full scan: unlisted seniority words, hardware
 # "system engineer" roles, and development/sales roles mentioning infra.
 INFRA_NOISE_EXCLUDE_KEYWORDS = [
-    "sr", "leader", "team leader",
+    "leader", "team leader",
     "radar", "rf", "chipset", "hardware", "embedded", "uas",
     "quantum control", "gtm", "presales", "researcher", "software engineer",
     "application security",
