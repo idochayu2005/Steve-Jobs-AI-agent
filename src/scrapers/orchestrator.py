@@ -917,6 +917,10 @@ class JobProducer:
             len(new_jobs),
         )
         for job in new_jobs:
+            # Requirements check first (degree / 7+ years): a job that fails
+            # it goes neither to Telegram nor to the sheet.
+            if self._sheet_rows is not None and not self._sheet_rows.prepare(job):
+                continue
             LOGGER.info("🤖 Analyzing: %s in %s", job["title"], job["location"])
 
             try:
@@ -940,8 +944,6 @@ class JobProducer:
             )
             if self._queue.append(alert):
                 LOGGER.info("✅ Job %s added to the alert queue.", job["id"])
-                if self._sheet_rows is not None:
-                    self._sheet_rows.prepare(job)
             else:
                 LOGGER.info("ℹ️ Job %s is already queued.", job["id"])
             LOGGER.info("-" * 40)

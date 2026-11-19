@@ -218,8 +218,13 @@ class SheetRowPreparer:
         self._store = store
         self._today = today
 
-    def prepare(self, job: Mapping[str, Any]) -> None:
-        """Store the job's row unless the sheet filters skip it."""
+    def prepare(self, job: Mapping[str, Any]) -> bool:
+        """Store the job's row; return False when the job should be skipped.
+
+        A job requiring a Bachelor's degree or 7+ years is skipped for both
+        the sheet and Telegram. Errors keep the job (fail open), so a broken
+        description fetch never hides a job.
+        """
 
         try:
             text = self._fetch_text(
@@ -228,8 +233,8 @@ class SheetRowPreparer:
             details = self._extract(str(job.get("title", "")), text)
             reason = skip_reason(details)
             if reason:
-                LOGGER.info("📄 Sheet: skipping %s (%s).", job.get("id"), reason)
-                return
+                LOGGER.info("📄 Skipping %s (%s).", job.get("id"), reason)
+                return False
             self._store.put(str(job["id"]), build_row(job, details, self._today()))
         except Exception as error:  # noqa: BLE001 - never break the scan
             LOGGER.warning(
@@ -237,6 +242,7 @@ class SheetRowPreparer:
                 job.get("id"),
                 type(error).__name__,
             )
+        return True
 
 
 # --- Duplicate detection -------------------------------------------------
