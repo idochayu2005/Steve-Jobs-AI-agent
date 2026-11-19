@@ -40,10 +40,13 @@ JOB_URL_RE = re.compile(
     re.IGNORECASE,
 )
 NOISE_RE = re.compile(
-    r"(?i)^(view job|apply|easy apply|promoted|actively recruiting|be an early|"
-    r"see all jobs|see more jobs|unsubscribe|help|manage|your job alert|"
-    r"\d+\+? new jobs?|.*\bconnections?\b.*|.*\balumni\b.*|.*\bapplicants?\b.*|"
-    r".*\bago$|.*school.*|this company.*|new$|-+|=+|\W*)$"
+    # Badge / call-to-action lines LinkedIn puts around each job card, e.g.
+    # "Apply with resume & profile", "1 company alum", "8 company alumni".
+    r"(?i)^(view job.*|apply\b.*|easy apply.*|promoted.*|actively recruiting.*|"
+    r"be an early.*|see all jobs.*|see more jobs.*|unsubscribe.*|help|manage.*|"
+    r"your job alert.*|you may be a fit.*|top applicant.*|"
+    r"\d+\+? new jobs?.*|.*\bconnections?\b.*|.*\balum(ni)?\b.*|"
+    r".*\bapplicants?\b.*|.*\bago$|.*school.*|this company.*|new$|-+|=+|\W*)$"
 )
 
 

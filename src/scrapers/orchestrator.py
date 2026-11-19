@@ -126,7 +126,7 @@ TARGET_ROLE_KEYWORDS = [
     "security analyst", "incident response", "incident responder",
     "cloud security", "security administrator", "identity and access", "iam",
     "system administrator", "systems administrator", "sysadmin",
-    "it engineer", "it administrator",
+    "it engineer", "it administrator", "it systems",
     "system engineer", "systems engineer",
     "cloud operations", "cloud support", "infrastructure",
     "monitoring", "cloud monitoring"
@@ -973,6 +973,7 @@ def run_scraper(
     health_store: ScraperHealthStore | None = None,
     heartbeat_notifier: OperationalMessageSender | None = None,
     sheet_rows: SheetRowPreparer | None = None,
+    health_digest_file: Any = None,
 ) -> None:
     """Scan, analyze, and enqueue new jobs without contacting Telegram.
 
@@ -987,7 +988,7 @@ def run_scraper(
         history_store=history_store or JobHistoryStore(HISTORY_FILE),
         health_store=health_store or ScraperHealthStore(HEALTH_FILE),
         reporter=OperationalReporter(
-            heartbeat_notifier, digest_file=DATA_DIR / "health_digest_sent.txt"
+            heartbeat_notifier, digest_file=health_digest_file
         ),
         sheet_rows=sheet_rows,
     ).run()
@@ -1020,7 +1021,11 @@ def main() -> None:
         )
 
     try:
-        run_scraper(heartbeat_notifier=heartbeat_notifier, sheet_rows=sheet_rows)
+        run_scraper(
+            heartbeat_notifier=heartbeat_notifier,
+            sheet_rows=sheet_rows,
+            health_digest_file=DATA_DIR / "health_digest_sent.txt",
+        )
     finally:
         if heartbeat_notifier is not None:
             heartbeat_notifier.close()

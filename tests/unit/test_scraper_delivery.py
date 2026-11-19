@@ -854,11 +854,15 @@ class ScraperProducerTests(unittest.TestCase):
                         ),
                         health_store=health_store,
                         heartbeat_notifier=notifier,
+                        health_digest_file=Path(directory) / "digest.txt",
                     )
 
         sent_messages = [entry.args[0] for entry in notifier.send.call_args_list]
+        # One daily failing-sites summary, then only heartbeats.
+        self.assertEqual(len(sent_messages), 3)
+        self.assertIn("Example: 4 failed scans in a row", sent_messages[0])
         self.assertEqual(
-            sent_messages,
+            sent_messages[1:],
             [scraper.HEARTBEAT_MESSAGE, scraper.HEARTBEAT_MESSAGE],
         )
 
